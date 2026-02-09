@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+
+# Logs et exports générés par le plugin
+logs/*.log
+exports/*.log
+exports/*.txt
+!exports/.gitkeep
+!logs/.gitkeep
+
+# Fichiers IDE / éditeur
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Fichiers de config locaux (si vous en ajoutez)
+*.local
+.env
+.env.local

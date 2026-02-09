@@ -1,0 +1,9 @@
+[general]
+icon=icon.png
+name=DataTerrain_photonormalizer
+description=Normalise les photos pour QField Cloud (renommage, redimensionnement, nettoyage)
+version=1.0
+qgisMinimumVersion=3.16
+author=Aguirre MAURIN [OBF - sd_21]
+email=aguirre.maurin@ofb.gouv.fr
+about=Outil pour standardiser les photos liées à une couche QField Cloud.

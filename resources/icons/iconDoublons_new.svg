@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect width="24" height="24" fill="white"/>
+<path d="M12 2L2 7V20C2 20.5304 2.21071 21.0391 2.58579 21.4142C2.96086 21.7893 3.46957 22 4 22H18C18.5304 22 19.0391 21.7893 19.4142 21.4142C19.7893 21.0391 20 20.5304 20 20V7L12 2Z" fill="#E74C3C"/>
+<path d="M12 4L20 9V22H4V9L12 4Z" fill="#C0392B"/>
+<path d="M12 6L18 11V20H6V11L12 6Z" fill="#FFFFFF" fill-opacity="0.3"/>
+<path d="M12 8L16 13V18H8V13L12 8Z" fill="#FFFFFF" fill-opacity="0.5"/>
+</svg>
