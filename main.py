@@ -2,6 +2,8 @@
 """
 Point d'entrée principal du plugin PhotoNormalizer
 """
+# pyright: reportMissingImports=false
+# Les modules qgis.* sont fournis par QGIS à l'exécution ; l'éditeur ne les résout pas.
 
 from qgis.PyQt.QtWidgets import QAction
 from qgis.PyQt.QtGui import QIcon

@@ -11,6 +11,7 @@ from qgis.PyQt.QtWidgets import QMessageBox
 from qgis.PyQt.QtCore import QDate, QDateTime
 from qgis.core import QgsProject, QgsVectorLayer, QgsFeature, QgsGeometry, QgsPointXY
 from .log_handler import LogHandler, LogWindow
+from .project_config import get_dcim_path, get_gpkg_path, get_cloud_base, get_backup_dir
 
 # Importation pour le traitement d'images
 try:
@@ -19,6 +20,14 @@ try:
 except ImportError:
     HAS_PIL = False
     print("⚠️  Module PIL/Pillow non disponible. Installation recommandée: pip install pillow")
+
+# Mode sécurisé : si False, les "doublons" détectés automatiquement (mêmes coordonnées)
+# sont déplacés vers ARCHIVE_DOUBLONS_DIR au lieu d'être supprimés.
+# Mettre True pour retrouver l'ancien comportement (suppression directe).
+SUPPRESSION_AUTO_DOUBLONS = False
+
+# Dossier d'archive des doublons (sous le répertoire cloud, défini dans project_config)
+ARCHIVE_DOUBLONS_DIR_NAME = "DataTerrain_DCIM_archive_doublons"
 
 class PhotoNormalizer:
     """
@@ -33,6 +42,46 @@ class PhotoNormalizer:
         plugin_dir = os.path.dirname(os.path.dirname(__file__))  # Remonter au dossier du plugin
         self.export_dir = os.path.join(plugin_dir, 'exports')
         os.makedirs(self.export_dir, exist_ok=True)
+
+    def _get_archive_doublons_dir(self, dcim_path=None):
+        """Retourne le chemin du dossier d'archive des doublons (sous le répertoire cloud)."""
+        return os.path.join(get_cloud_base(), ARCHIVE_DOUBLONS_DIR_NAME)
+
+    def _supprimer_ou_archiver_doublon(self, file_path, raison, dcim_path=None):
+        """
+        Supprime le fichier (si SUPPRESSION_AUTO_DOUBLONS) ou le déplace vers
+        (répertoire cloud)/DataTerrain_DCIM_archive_doublons/ pour éviter de perdre des photos par erreur.
+        Retourne True si l'action a réussi (suppression ou archivage).
+        """
+        if not file_path or not os.path.exists(file_path):
+            return False
+        nom = os.path.basename(file_path)
+        archive_dir = self._get_archive_doublons_dir(dcim_path)
+        try:
+            if SUPPRESSION_AUTO_DOUBLONS:
+                os.remove(file_path)
+                if self.log_handler:
+                    self.log_handler.success(f"🗑️  Photo doublon supprimée: {nom} ({raison})")
+                return True
+            else:
+                os.makedirs(archive_dir, exist_ok=True)
+                dest = os.path.join(archive_dir, nom)
+                if os.path.exists(dest):
+                    base, ext = os.path.splitext(nom)
+                    for i in range(1, 1000):
+                        dest = os.path.join(archive_dir, f"{base}_{i}{ext}")
+                        if not os.path.exists(dest):
+                            break
+                os.rename(file_path, dest)
+                if self.log_handler:
+                    self.log_handler.success(
+                        f"📦  Doublon archivé (non supprimé): {nom} → {ARCHIVE_DOUBLONS_DIR_NAME}/ ({raison})"
+                    )
+                return True
+        except Exception as e:
+            if self.log_handler:
+                self.log_handler.error(f"❌ Erreur pour {nom}: {e}")
+            return False
         
     def run(self):
         """Exécute le traitement principal"""
@@ -57,6 +106,9 @@ class PhotoNormalizer:
         elif mode == "orphan_analysis":
             self.analyse_orphelines()
             self._save_logs_automatically()
+        elif mode == "analyse_table":
+            self.run_analyse_table_attributaire_mode()
+            self._save_logs_automatically()
         elif mode == "renommage":
             self.run_renommage_mode()
             self._save_logs_automatically()
@@ -75,16 +127,26 @@ class PhotoNormalizer:
         elif mode == "clean_photos":
             self.run_clean_photos_mode()
             self._save_logs_automatically()
+        elif mode == "reconcilier_photos":
+            self.run_reconcilier_photos_mode()
+            self._save_logs_automatically()
         elif mode == "normal":
             self.run_normal_mode()
             self._save_logs_automatically()
     
     def run_clean_photos_mode(self):
-        """Mode isolé: nettoie les champs photo incohérents (FID du nom ≠ FID de l'entité)."""
+        """Mode isolé: synchronise les champs photo (ancien nom → nouveau), restaure depuis l'archive si besoin, puis nettoie les incohérences."""
         self.log_handler.info("📋 Mode Nettoyage des champs photo incohérents en cours...")
-        gpkg_file = "/home/e357/Qfield/cloud/DataTerrain/donnees_terrain.gpkg"
+        gpkg_file = get_gpkg_path()
         layer_name = "saisies_terrain"
+        dcim_path = get_dcim_path()
         try:
+            nb_sync = self.synchroniser_champs_photo_entites(gpkg_file, layer_name, dcim_path)
+            if nb_sync > 0:
+                self.log_handler.success(f"✅ Champs photo synchronisés ({nb_sync} entités)")
+            nb_repares = self.reparer_photos_manquantes_depuis_archive(gpkg_file, layer_name, dcim_path)
+            if nb_repares > 0:
+                self.log_handler.success(f"✅ {nb_repares} photo(s) restaurée(s) depuis l'archive")
             nb = self.clean_inconsistent_photo_fields(gpkg_file, layer_name)
             if nb > 0:
                 self.log_handler.success(f"✅ Champs photo nettoyés pour {nb} entité(s) incohérente(s)")
@@ -92,6 +154,24 @@ class PhotoNormalizer:
                 self.log_handler.info("ℹ️  Aucun champ photo incohérent détecté")
         except Exception as e:
             self.log_handler.error(f"❌ Erreur lors du nettoyage des champs photo: {e}")
+
+    def run_reconcilier_photos_mode(self):
+        """
+        Parcourt chaque photo dans DCIM :
+        - Si attachée à une entité : vérifie que les coordonnées correspondent (bonne photo pour bonne entité).
+        - Si non attachée : cherche une entité correspondante (FID ou coordonnées) ou crée une entité.
+        """
+        self.log_handler.info("📋 Mode Réconcilier photos et entités en cours...")
+        gpkg_file = get_gpkg_path()
+        layer_name = "saisies_terrain"
+        dcim_path = get_dcim_path()
+        try:
+            nb_verif, nb_attachees, nb_creees = self.reconcilier_photos_avec_entites(gpkg_file, layer_name, dcim_path)
+            self.log_handler.success(
+                f"✅ Réconciliation terminée : {nb_verif} vérifiées, {nb_attachees} attachées, {nb_creees} entités créées"
+            )
+        except Exception as e:
+            self.log_handler.error(f"❌ Erreur lors de la réconciliation: {e}")
             
     def detect_unreferenced_photos(self):
         """Détecte les photos non référencées"""
@@ -137,7 +217,7 @@ class PhotoNormalizer:
             # Créer et afficher la dialogue
             dialog = DoublonsDialog(
                 doublons_groups, 
-                "/home/e357/Qfield/cloud/DataTerrain/DCIM",
+                get_dcim_path(),
                 self.iface.mainWindow(),
                 self.log_handler  # Passer le log_handler
             )
@@ -171,6 +251,16 @@ class PhotoNormalizer:
             self.log_handler.info("✅ Analyse des photos orphelines terminée")
         except Exception as e:
             self.log_handler.error(f"❌ Erreur lors de l'analyse: {e}")
+    
+    def run_analyse_table_attributaire_mode(self):
+        """Mode isolé: analyse complète de la table attributaire"""
+        from ..scripts.analyse_table_attributaire import analyser_table_attributaire
+        self.log_handler.info("📊 Analyse de la table attributaire en cours...")
+        try:
+            analyser_table_attributaire(self.log_handler, self.export_dir)
+            self.log_handler.info("✅ Analyse complète de la table attributaire terminée")
+        except Exception as e:
+            self.log_handler.error(f"❌ Erreur lors de l'analyse de la table attributaire: {e}")
             
     def run_normal_mode(self):
         """Exécute le mode normal - Traitement complet de normalisation"""
@@ -178,8 +268,8 @@ class PhotoNormalizer:
         
         # Étape 0: Sauvegarde initiale et vérification
         self.log_handler.info("📋 Étape 0/8: Préparation et sauvegarde...")
-        dcim_path = "/home/e357/Qfield/cloud/DataTerrain/DCIM"
-        gpkg_file = "/home/e357/Qfield/cloud/DataTerrain/donnees_terrain.gpkg"
+        dcim_path = get_dcim_path()
+        gpkg_file = get_gpkg_path()
         layer_name = "saisies_terrain"
         
         # Créer une sauvegarde du dossier DCIM avant toute opération
@@ -209,6 +299,39 @@ class PhotoNormalizer:
         if not os.path.exists(gpkg_file):
             self.log_handler.error(f"❌ Fichier GeoPackage introuvable: {gpkg_file}")
             return
+        
+        # Créer le dossier d'archive des doublons (DataTerrain_DCIM_archive_doublons sous Qfield/cloud)
+        archive_dir = self._get_archive_doublons_dir(dcim_path)
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            self.log_handler.info(f"📁 Dossier d'archive doublons: {archive_dir}")
+        except Exception as e:
+            self.log_handler.warning(f"⚠️  Impossible de créer le dossier d'archive: {archive_dir} — {e}")
+        
+        # Migrer l'ancien dossier _archive_plugin (sous DCIM) vers le nouveau chemin si il existe
+        old_archive = os.path.join(dcim_path, "_archive_plugin")
+        if os.path.isdir(old_archive):
+            try:
+                old_files = [f for f in os.listdir(old_archive) if f.lower().endswith(('.jpg', '.jpeg'))]
+                if old_files:
+                    for f in old_files:
+                        src = os.path.join(old_archive, f)
+                        dst = os.path.join(archive_dir, f)
+                        if os.path.isfile(src):
+                            if os.path.exists(dst):
+                                base, ext = os.path.splitext(f)
+                                for i in range(1, 1000):
+                                    dst = os.path.join(archive_dir, f"{base}_{i}{ext}")
+                                    if not os.path.exists(dst):
+                                        break
+                            os.rename(src, dst)
+                    self.log_handler.success(f"📦 {len(old_files)} photo(s) migrée(s) de _archive_plugin vers {ARCHIVE_DOUBLONS_DIR_NAME}")
+                # Supprimer l'ancien dossier s'il est vide
+                if not os.listdir(old_archive):
+                    os.rmdir(old_archive)
+                    self.log_handler.info("📁 Ancien dossier _archive_plugin supprimé (vide)")
+            except Exception as e:
+                self.log_handler.warning(f"⚠️  Migration _archive_plugin → {ARCHIVE_DOUBLONS_DIR_NAME} non effectuée: {e}")
         
         self.log_handler.success("✅ Initialisation terminée")
         
@@ -281,9 +404,9 @@ class PhotoNormalizer:
             self.log_handler.error(f"❌ Erreur lors de la correction des FID: {e}")
             # Continuer malgré l'erreur
         
-        # Étape 8b: Synchronisation des champs photo des entités (ancien nom → nouveau nom)
+        # Étape 8b: Synchronisation des champs photo des entités (ancien nom → nouveau nom, restauration depuis archive)
         try:
-            nb_sync = self.synchroniser_champs_photo_entites(gpkg_file, layer_name)
+            nb_sync = self.synchroniser_champs_photo_entites(gpkg_file, layer_name, dcim_path)
             if nb_sync > 0:
                 self.log_handler.success(f"✅ Champs photo synchronisés ({nb_sync} entités mises à jour)")
             else:
@@ -291,6 +414,14 @@ class PhotoNormalizer:
         except Exception as e:
             self.log_handler.error(f"❌ Erreur synchronisation champs photo: {e}")
             # Continuer malgré l'erreur
+        
+        # Étape 8b bis: Réparer les entités dont la photo est dans l'archive (restaurer vers DCIM)
+        try:
+            nb_repares = self.reparer_photos_manquantes_depuis_archive(gpkg_file, layer_name, dcim_path)
+            if nb_repares > 0:
+                self.log_handler.success(f"✅ {nb_repares} photo(s) restaurée(s) depuis l'archive vers DCIM")
+        except Exception as e:
+            self.log_handler.error(f"❌ Erreur réparation photos depuis archive: {e}")
         
         # Étape 8c: Nettoyage des champs photo incohérents (ex. _0_ ou FID nom ≠ FID entité)
         try:
@@ -379,24 +510,50 @@ class PhotoNormalizer:
             for old_name, new_name in sorted(photos_renommees):
                 self.log_handler.info(f"  📋 {old_name} → {new_name}")
         
-        # Vérifier si les photos disparues sont dans le dossier de synchronisation QField
+        # Vérifier où sont les photos "disparues" : QField sync, archive doublons (mode sécurisé), ou vraiment perdues
         photos_deplacees_qfield = set()
+        photos_archivees = set()
         photos_reellement_disparues = set()
+        
+        archive_dir = self._get_archive_doublons_dir(dcim_path)
+        archive_list = set()
+        if os.path.exists(archive_dir):
+            archive_list = {f for f in os.listdir(archive_dir) if f.lower().endswith(('.jpg', '.jpeg'))}
+        
+        # Déterminer le nom sous lequel la photo peut être (renommée puis archivée)
+        def _nom_archive(photo):
+            if self.log_handler.is_photo_renamed(photo):
+                fn = self.log_handler.get_final_photo_name(photo)
+                return fn if fn else photo
+            return photo
         
         qfield_sync_dcim = os.path.join(os.path.dirname(dcim_path), '.qfieldsync', 'download', 'DCIM')
         if os.path.exists(qfield_sync_dcim):
-            sync_photos = [f for f in os.listdir(qfield_sync_dcim) 
-                          if f.lower().endswith(('.jpg', '.jpeg'))]
-            
+            sync_photos = {f for f in os.listdir(qfield_sync_dcim) 
+                          if f.lower().endswith(('.jpg', '.jpeg'))}
             for photo in photos_disparues:
-                if photo in sync_photos:
+                nom_a_chercher = _nom_archive(photo)
+                if photo in sync_photos or nom_a_chercher in sync_photos:
                     photos_deplacees_qfield.add(photo)
+                elif photo in archive_list or nom_a_chercher in archive_list:
+                    photos_archivees.add(photo)
                 else:
                     photos_reellement_disparues.add(photo)
         else:
-            photos_reellement_disparues = photos_disparues
+            for photo in photos_disparues:
+                nom_a_chercher = _nom_archive(photo)
+                if photo in archive_list or nom_a_chercher in archive_list:
+                    photos_archivees.add(photo)
+                else:
+                    photos_reellement_disparues.add(photo)
         
         # Afficher les résultats avec messages améliorés
+        if photos_archivees:
+            self.log_handler.info(f"📦 {len(photos_archivees)} photo(s) déplacée(s) vers {archive_dir} (mode sécurisé, pas de suppression):")
+            for photo in sorted(photos_archivees)[:5]:
+                self.log_handler.info(f"   • {photo}")
+            if len(photos_archivees) > 5:
+                self.log_handler.info(f"   • ... et {len(photos_archivees) - 5} autres")
         if photos_deplacees_qfield:
             self.log_handler.warning(f"⚠️  {len(photos_deplacees_qfield)} photos ont été déplacées dans le dossier de synchronisation QField:")
             self.log_handler.warning("   Cela peut être dû à la synchronisation avec QField Cloud.")
@@ -406,20 +563,23 @@ class PhotoNormalizer:
                 self.log_handler.warning(f"   • ... et {len(photos_deplacees_qfield) - 5} autres")
         
         if photos_reellement_disparues:
-            self.log_handler.error(f"❌ ATTENTION: {len(photos_reellement_disparues)} photos n'ont pas été retrouvées:")
+            self.log_handler.error(f"❌ ATTENTION: {len(photos_reellement_disparues)} photos n'ont pas été retrouvées (ni dans DCIM, ni dans {ARCHIVE_DOUBLONS_DIR_NAME}):")
             self.log_handler.error("Cela peut indiquer un problème lors du traitement. Vérifiez les logs détaillés.")
             for photo in sorted(photos_reellement_disparues):
                 self.log_handler.error(f"  🚨 {photo}")
-            
-            # Suggérer des actions
             self.log_handler.warning("💡 Actions recommandées:")
             self.log_handler.warning("  1. Vérifiez la sauvegarde créée au début du traitement")
             self.log_handler.warning("  2. Consultez le rapport détaillé des opérations")
             self.log_handler.warning("  3. Vérifiez que ces photos n'ont pas été renommées ou déplacées")
+        elif photos_archivees or photos_deplacees_qfield:
+            self.log_handler.success("✅ Toutes les photos initiales sont prises en compte (renommées, archivées ou déplacées QField)")
+            if photos_archivees:
+                self.log_handler.info(f"   📦 {len(photos_archivees)} dans {ARCHIVE_DOUBLONS_DIR_NAME} (mode sécurisé)")
+            if photos_deplacees_qfield:
+                self.log_handler.info(f"   📁 {len(photos_deplacees_qfield)} dans le dossier de sync QField")
         else:
             self.log_handler.success("✅ Toutes les photos initiales ont été correctement traitées")
             self.log_handler.success("   - Les photos renommées sont suivies et accessibles")
-            self.log_handler.success("   - Les doublons ont été supprimés comme prévu")
             self.log_handler.success("   - Aucune perte de données détectée")
         
         if photos_nouvelles:
@@ -455,10 +615,14 @@ class PhotoNormalizer:
         else:
             self.log_handler.info(f"  ℹ️  Photos renommées: {len(photos_renommees)}")
         
-        if len(photos_disparues) > 0:
-            self.log_handler.error(f"  ❌ Photos non retrouvées: {len(photos_disparues)} (voir détails ci-dessus)")
+        if len(photos_reellement_disparues) > 0:
+            self.log_handler.error(f"  ❌ Photos non retrouvées (à vérifier): {len(photos_reellement_disparues)}")
+            if photos_archivees:
+                self.log_handler.info(f"  📦 Photos archivées ({ARCHIVE_DOUBLONS_DIR_NAME}): {len(photos_archivees)}")
+        elif len(photos_disparues) > 0:
+            self.log_handler.info(f"  📦 Photos déplacées/archivées: {len(photos_disparues)} (voir détails ci-dessus)")
         else:
-            self.log_handler.success(f"  ✅ Photos non retrouvées: {len(photos_disparues)} (tout est en ordre!)")
+            self.log_handler.success(f"  ✅ Toutes les photos initiales sont traitées ou archivées")
         
         if len(photos_nouvelles) > 0:
             self.log_handler.info(f"  ✨ Nouvelles photos créées: {len(photos_nouvelles)}")
@@ -477,10 +641,12 @@ class PhotoNormalizer:
         if report_file:
             self.log_handler.info(f"📋 Rapport détaillé: {report_file}")
         
-        # Avertissement si des photos ont réellement disparu
-        if photos_disparues:
-            self.log_handler.error("❌ ATTENTION: Des photos ont réellement disparu pendant le traitement!")
+        # Avertissement uniquement si des photos vraiment perdues (ni renommées, ni archivées)
+        if photos_reellement_disparues:
+            self.log_handler.error(f"❌ ATTENTION: Des photos n'ont pas été retrouvées (ni en DCIM ni dans {ARCHIVE_DOUBLONS_DIR_NAME}).")
             self.log_handler.error("Veuillez consulter le rapport détaillé pour plus d'informations.")
+        elif photos_archivees and not photos_reellement_disparues:
+            self.log_handler.success(f"✅ Aucune perte : les photos « manquantes » sont dans {archive_dir} (mode sécurisé).")
         else:
             self.log_handler.success("✅ Toutes les photos ont été correctement traitées sans perte")
     
@@ -489,8 +655,8 @@ class PhotoNormalizer:
         self.log_handler.info("📋 Mode Renommage en cours...")
         
         # Paramètres
-        dcim_path = "/home/e357/Qfield/cloud/DataTerrain/DCIM"
-        gpkg_file = "/home/e357/Qfield/cloud/DataTerrain/donnees_terrain.gpkg"
+        dcim_path = get_dcim_path()
+        gpkg_file = get_gpkg_path()
         layer_name = "saisies_terrain"
         
         # Vérifications
@@ -521,8 +687,8 @@ class PhotoNormalizer:
         self.log_handler.info("📋 Mode Photos Orphelines avec FID en cours...")
         
         # Paramètres
-        dcim_path = "/home/e357/Qfield/cloud/DataTerrain/DCIM"
-        gpkg_file = "/home/e357/Qfield/cloud/DataTerrain/donnees_terrain.gpkg"
+        dcim_path = get_dcim_path()
+        gpkg_file = get_gpkg_path()
         layer_name = "saisies_terrain"
         
         # Vérifications
@@ -556,8 +722,8 @@ class PhotoNormalizer:
     def run_renommage_formulaires_mode(self):
         """Renomme les photos *_INCONNU_INCONNU_* d'après les champs nom_agent et type_saisie des entités."""
         self.log_handler.info("📋 Mode Renommage d'après les formulaires en cours...")
-        dcim_path = "/home/e357/Qfield/cloud/DataTerrain/DCIM"
-        gpkg_file = "/home/e357/Qfield/cloud/DataTerrain/donnees_terrain.gpkg"
+        dcim_path = get_dcim_path()
+        gpkg_file = get_gpkg_path()
         layer_name = "saisies_terrain"
         if not os.path.exists(dcim_path):
             self.log_handler.error(f"❌ Dossier DCIM introuvable: {dcim_path}")
@@ -582,8 +748,8 @@ class PhotoNormalizer:
         self.log_handler.info("📋 Mode Correction FID en cours...")
         
         # Paramètres
-        dcim_path = "/home/e357/Qfield/cloud/DataTerrain/DCIM"
-        gpkg_file = "/home/e357/Qfield/cloud/DataTerrain/donnees_terrain.gpkg"
+        dcim_path = get_dcim_path()
+        gpkg_file = get_gpkg_path()
         layer_name = "saisies_terrain"
         
         # Vérifications
@@ -677,17 +843,11 @@ class PhotoNormalizer:
                     old_path = os.path.join(dcim_path, photo_name)
                     
                     if photo_existante and isinstance(photo_existante, str) and photo_existante.strip():
-                        # L'entité a déjà une photo valide → supprimer le doublon
-                        if os.path.exists(old_path):
-                            try:
-                                os.remove(old_path)
-                                photos_corrigees += 1
-                                self.log_handler.success(
-                                    f"🗑️  Photo doublon supprimée: {photo_name} "
-                                    f"(entité FID {existing_fid} a déjà une photo aux mêmes coordonnées)"
-                                )
-                            except Exception as e:
-                                self.log_handler.error(f"❌ Erreur suppression doublon {photo_name}: {e}")
+                        # L'entité a déjà une photo valide → supprimer ou archiver le doublon
+                        if self._supprimer_ou_archiver_doublon(
+                            old_path, f"entité FID {existing_fid} a déjà une photo aux mêmes coordonnées", dcim_path
+                        ):
+                            photos_corrigees += 1
                         continue
                     
                     # L'entité n'a pas de photo → renommer la photo avec le FID existant
@@ -706,16 +866,10 @@ class PhotoNormalizer:
                             self.log_handler.warning(f"⚠️  Fichier source introuvable: {photo_name}")
                     else:
                         self.log_handler.warning(f"⚠️  Conflit de nom: {new_photo_name} existe déjà")
-                        # Si le fichier avec le nouveau nom existe déjà, supprimer l'ancien doublon
-                        if os.path.exists(old_path):
-                            try:
-                                os.remove(old_path)
-                                self.log_handler.success(
-                                    f"🗑️  Photo doublon supprimée: {photo_name} "
-                                    f"(fichier {new_photo_name} existe déjà pour entité FID {existing_fid})"
-                                )
-                            except Exception as e:
-                                self.log_handler.warning(f"⚠️  Impossible de supprimer doublon {photo_name}: {e}")
+                        # Si le fichier avec le nouveau nom existe déjà, supprimer ou archiver l'ancien
+                        self._supprimer_ou_archiver_doublon(
+                            old_path, f"fichier {new_photo_name} existe déjà pour entité FID {existing_fid}", dcim_path
+                        )
                 else:
                     # Créer une nouvelle entité si aucune n'existe
                     self.log_handler.info(f"ℹ️  Aucune entité existante trouvée, création d'une nouvelle")
@@ -795,7 +949,7 @@ class PhotoNormalizer:
         self.log_handler.info("📋 Mode Optimisation en cours...")
         
         # Paramètres
-        dcim_path = "/home/e357/Qfield/cloud/DataTerrain/DCIM"
+        dcim_path = get_dcim_path()
         
         # Vérifications
         if not os.path.exists(dcim_path):
@@ -898,7 +1052,7 @@ class PhotoNormalizer:
             from datetime import datetime
             
             # Créer un dossier de backup centralisé
-            backup_dir = "/home/e357/Qfield/cloud/donnee_terrain_backups"
+            backup_dir = get_backup_dir()
             os.makedirs(backup_dir, exist_ok=True)
             
             # Nom du backup avec timestamp
@@ -1046,7 +1200,7 @@ class PhotoNormalizer:
             from datetime import datetime
             
             # Créer un dossier de backup centralisé
-            backup_dir = "/home/e357/Qfield/cloud/donnee_terrain_backups"
+            backup_dir = get_backup_dir()
             os.makedirs(backup_dir, exist_ok=True)
             
             # Nom du backup avec timestamp
@@ -1130,20 +1284,168 @@ class PhotoNormalizer:
         
         return layer
 
-    def synchroniser_champs_photo_entites(self, gpkg_file, layer_name):
+    def _extraire_nom_fichier_photo(self, photo_val):
+        """Extrait le nom de fichier depuis un champ photo (DCIM/xxx.jpg, file:///path/xxx.jpg, etc.)."""
+        if not photo_val or not isinstance(photo_val, str):
+            return None
+        s = photo_val.strip()
+        # Retirer préfixes courants (DCIM/, file://, content://, chemins absolus)
+        for prefix in ('DCIM/', 'file://', 'content://'):
+            if s.lower().startswith(prefix):
+                s = s[len(prefix):].lstrip('/')
+        # Prendre le dernier segment du chemin (nom de fichier)
+        name = s.split('/')[-1].split('\\')[-1].strip()
+        return name if name.lower().endswith(('.jpg', '.jpeg')) else None
+
+    def _get_dcim_search_dirs(self, dcim_path):
+        """Retourne les répertoires à fouiller (DCIM principal + .qfieldsync/download/DCIM)."""
+        sync_dcim = os.path.join(os.path.dirname(dcim_path), '.qfieldsync', 'download', 'DCIM')
+        return [d for d in (dcim_path, sync_dcim) if os.path.isdir(d)]
+
+    def _trouver_photo_par_fid_dans_dcim(self, dcim_path, entity_fid, old_name=None, feature=None):
+        """
+        Cherche dans DCIM (et .qfieldsync/download/DCIM) un fichier dont le nom contient le FID de l'entité.
+        Quand plusieurs photos ont le même FID (sessions différentes), préfère celle qui correspond
+        à l'agent de old_name ou au nom_agent de l'entité (ex. maurin_aguirre vs cuenin_chris).
+        """
+        pattern = f"_{entity_fid}_"
+        candidates = []
+        seen = set()
+        for search_dir in self._get_dcim_search_dirs(dcim_path):
+            for f in os.listdir(search_dir):
+                if f.lower().endswith(('.jpg', '.jpeg')) and pattern in f and f not in seen:
+                    seen.add(f)
+                    candidates.append(f)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        # Plusieurs photos avec le même FID : préférer celle qui correspond à l'agent
+        agent_hint = None
+        if old_name:
+            # Format: DT_YYYY-MM-DD_FID_agent_type_X_Y.jpg → capturer agent (ex. maurin_aguirre)
+            match = re.match(r'DT_\d{4}-\d{2}-\d{2}_\d+_([^_]+(?:_[^_]+)?)_', old_name)
+            if match:
+                agent_hint = match.group(1).lower()
+        if not agent_hint and feature is not None:
+            nom = feature['nom_agent'] if 'nom_agent' in feature.fields().names() else None
+            if nom and str(nom).strip().upper() != 'INCONNU':
+                agent_hint = self._sanitize_for_filename(str(nom)).replace(' ', '_').lower()
+        if agent_hint:
+            parts = [p for p in agent_hint.replace('-', '_').split('_') if len(p) > 1]
+            for c in candidates:
+                c_lower = c.lower()
+                if agent_hint in c_lower or (parts and all(p in c_lower for p in parts)):
+                    return c
+            self.log_handler.warning(
+                f"⚠️ Plusieurs photos avec FID {entity_fid} (sessions différentes). "
+                f"Aucune ne correspond à l'agent '{agent_hint}'. Utilisation de la première trouvée."
+            )
+        return candidates[0]
+
+    def _trouver_photo_par_coord_dans_dcim(self, dcim_path, old_name, entity_fid):
+        """
+        Cherche dans DCIM un fichier par coordonnées.
+        Cas 1: ancien format DT_YYYYMMDD_HHMMSS_X_Y.jpg → photos renommées par le plugin
+        peuvent être en DT_YYYY-MM-DD_0_INCONNU_INCONNU_X_Y.jpg ou DT_YYYY-MM-DD_FID_...
+        """
+        from ..scripts.analyse_orphelines import extraire_coord_du_nom
+        _, x_old, y_old = extraire_coord_du_nom(old_name)
+        if x_old is None or y_old is None:
+            return None
+        tol = 0.02  # tolérance pour arrondis (ex. 5985522.246 vs 5985522.25)
+        candidates_with_fid = []
+        candidates_any = []
+        for search_dir in self._get_dcim_search_dirs(dcim_path):
+            for f in os.listdir(search_dir):
+                if not f.lower().endswith(('.jpg', '.jpeg')):
+                    continue
+                fid_in_name, x, y = extraire_coord_du_nom(f)
+                if x is None or y is None:
+                    continue
+                if abs(float(x) - float(x_old)) < tol and abs(float(y) - float(y_old)) < tol:
+                    if fid_in_name == entity_fid:
+                        candidates_with_fid.append(f)
+                    else:
+                        candidates_any.append(f)
+        # Priorité : fichier avec le FID de l'entité, sinon fichier unique par coordonnées
+        if candidates_with_fid:
+            return candidates_with_fid[0]
+        if len(candidates_any) == 1:
+            return candidates_any[0]
+        # Plusieurs candidats : préférer _0_INCONNU (format intermédiaire du plugin)
+        for c in candidates_any:
+            if "_0_INCONNU" in c:
+                return c
+        return candidates_any[0] if candidates_any else None
+
+    def _trouver_photo_par_coord_dans_archive(self, archive_dir, old_name, entity_fid, feature=None):
+        """
+        Cherche dans l'archive un fichier par coordonnées (format ancien QField ou nouveau).
+        Utilise old_name pour les coords, ou la géométrie de l'entité si disponible.
+        """
+        from ..scripts.analyse_orphelines import extraire_coord_du_nom
+        x_ref, y_ref = None, None
+        if feature and feature.geometry() and not feature.geometry().isEmpty():
+            pt = feature.geometry().asPoint()
+            x_ref, y_ref = pt.x(), pt.y()
+        if x_ref is None or y_ref is None:
+            _, x_ref, y_ref = extraire_coord_du_nom(old_name)
+        if x_ref is None or y_ref is None:
+            return None
+        tol = 0.02
+        candidates_with_fid = []
+        candidates_any = []
+        for f in os.listdir(archive_dir):
+            if not f.lower().endswith(('.jpg', '.jpeg')):
+                continue
+            fid_in_name, x, y = extraire_coord_du_nom(f)
+            if x is None or y is None:
+                continue
+            if abs(float(x) - float(x_ref)) < tol and abs(float(y) - float(y_ref)) < tol:
+                if fid_in_name == entity_fid:
+                    candidates_with_fid.append(f)
+                else:
+                    candidates_any.append(f)
+        if candidates_with_fid:
+            return candidates_with_fid[0]
+        if len(candidates_any) == 1:
+            return candidates_any[0]
+        for c in candidates_any:
+            if "_0_INCONNU" in c:
+                return c
+        return candidates_any[0] if candidates_any else None
+
+    def _chemin_photo_existe(self, dcim_path, filename):
+        """Vérifie si la photo existe dans DCIM ou .qfieldsync/download/DCIM. Retourne le chemin complet ou None."""
+        for d in self._get_dcim_search_dirs(dcim_path):
+            p = os.path.join(d, filename)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def synchroniser_champs_photo_entites(self, gpkg_file, layer_name, dcim_path=None):
         """
         Met à jour le champ 'photo' de chaque entité pour qu'il pointe vers le nom
         actuel du fichier (après renommage). Corrige les entités qui référencent
-        encore un ancien nom de photo.
+        encore un ancien nom de photo. Si le fichier est dans l'archive, le restaure
+        dans DCIM avant de mettre à jour.
+        Gère aussi les chemins au format QField (file://, etc.) et les cas où
+        la photo a été renommée mais le champ n'a pas été mis à jour (recherche par FID).
         Retourne le nombre d'entités mises à jour.
         """
         self.log_handler.info("📋 Synchronisation des champs photo des entités...")
+        dcim_path = dcim_path or get_dcim_path()
         try:
             layer = self.get_layer(gpkg_file, layer_name)
             photo_field_idx = layer.fields().indexFromName('photo')
             if photo_field_idx < 0:
                 self.log_handler.warning("⚠️  Champ 'photo' introuvable dans la couche")
                 return 0
+            archive_dir = self._get_archive_doublons_dir(dcim_path)
+            archive_list = {}
+            if archive_dir and os.path.exists(archive_dir):
+                archive_list = {f for f in os.listdir(archive_dir) if f.lower().endswith(('.jpg', '.jpeg'))}
             
             updated = 0
             layer.startEditing()
@@ -1151,16 +1453,80 @@ class PhotoNormalizer:
                 photo_val = feature['photo']
                 if not photo_val or not isinstance(photo_val, str):
                     continue
-                old_name = photo_val.replace('DCIM/', '').strip()
-                if not old_name.lower().endswith(('.jpg', '.jpeg')):
+                old_name = self._extraire_nom_fichier_photo(photo_val)
+                if not old_name:
                     continue
                 new_name = self.log_handler.get_final_photo_name(old_name)
-                if not new_name or new_name == old_name:
+                if not new_name:
+                    new_name = old_name
+                # Si pas de renommage connu (mapping vide) et fichier absent : chercher par FID puis par coordonnées
+                if new_name == old_name and not os.path.exists(os.path.join(dcim_path, old_name)):
+                    candidate = self._trouver_photo_par_fid_dans_dcim(
+                        dcim_path, feature.id(), old_name=old_name, feature=feature
+                    )
+                    if not candidate:
+                        candidate = self._trouver_photo_par_coord_dans_dcim(dcim_path, old_name, feature.id())
+                    if not candidate and archive_dir and os.path.exists(archive_dir) and archive_list:
+                        candidate = self._trouver_photo_par_coord_dans_archive(
+                            archive_dir, old_name, feature.id(), feature
+                        )
+                    if candidate:
+                        # Vérifier que les coords du candidat correspondent à l'entité (éviter mauvaises associations)
+                        from ..scripts.analyse_orphelines import extraire_coord_du_nom as _extraire
+                        _, x_cand, y_cand = _extraire(candidate)
+                        geom = feature.geometry()
+                        if x_cand is not None and y_cand is not None and geom and not geom.isEmpty():
+                            pt = geom.asPoint()
+                            if abs(pt.x() - float(x_cand)) >= 0.02 or abs(pt.y() - float(y_cand)) >= 0.02:
+                                self.log_handler.warning(
+                                    f"⚠️  Entité FID {feature.id()}: candidat {candidate} ignoré "
+                                    f"(coords {x_cand:.2f},{y_cand:.2f} ≠ entité {pt.x():.2f},{pt.y():.2f})"
+                                )
+                                candidate = None
+                        if candidate:
+                            new_name = candidate
+                            self.log_handler.info(f"📋 Entité FID {feature.id()}: chemin obsolète ({old_name}) → {new_name}")
+                if new_name == old_name:
+                    # Fichier absent et aucune correspondance trouvée : avertir (photo peut-être non synchronisée depuis QField)
+                    if not os.path.exists(os.path.join(dcim_path, old_name)):
+                        self.log_handler.warning(
+                            f"⚠️ Entité FID {feature.id()}: photo {old_name} introuvable "
+                            "(DCIM, archive, .qfieldsync). Pensez à synchroniser le projet depuis QField."
+                        )
                     continue
-                # Ne mettre à jour que si le FID dans le nouveau nom correspond à cette entité
-                # (évite qu'une entité 538 reçoive le fichier d'une entité 497)
+                # Si FID dans le nouveau nom est valide (!=0) et différent de l'entité, éviter les mauvaises associations
                 fid_dans_nom = self._fid_depuis_nom_photo(new_name)
-                if fid_dans_nom is not None and feature.id() != fid_dans_nom:
+                if fid_dans_nom is not None and fid_dans_nom != 0 and feature.id() != fid_dans_nom:
+                    continue
+                # Vérifier si le fichier existe (DCIM, .qfieldsync, ou archive)
+                new_path = os.path.join(dcim_path, new_name)
+                src_path = self._chemin_photo_existe(dcim_path, new_name)
+                if src_path and src_path != new_path:
+                    # Fichier dans .qfieldsync/download/DCIM : copier vers DCIM
+                    try:
+                        import shutil
+                        shutil.copy2(src_path, new_path)
+                        self.log_handler.info(f"📦 Photo copiée depuis .qfieldsync: {new_name}")
+                    except Exception as e:
+                        self.log_handler.warning(f"⚠️ Impossible de copier {new_name}: {e}")
+                        continue
+                elif not os.path.exists(new_path) and archive_list:
+                    # Fichier dans l'archive : restaurer vers DCIM
+                    if new_name in archive_list:
+                        src = os.path.join(archive_dir, new_name)
+                        if os.path.isfile(src):
+                            try:
+                                import shutil
+                                shutil.copy2(src, new_path)
+                                self.log_handler.info(f"📦 Photo restaurée depuis l'archive: {new_name}")
+                            except Exception as e:
+                                self.log_handler.warning(f"⚠️  Impossible de restaurer {new_name} depuis l'archive: {e}")
+                                continue
+                    else:
+                        self.log_handler.warning(f"⚠️  Fichier {new_name} introuvable (DCIM et archive), entité FID {feature.id()}")
+                        continue
+                elif not os.path.exists(new_path):
+                    self.log_handler.warning(f"⚠️  Fichier {new_name} introuvable, entité FID {feature.id()}")
                     continue
                 new_photo_val = f'DCIM/{new_name}'
                 layer.changeAttributeValue(feature.id(), photo_field_idx, new_photo_val)
@@ -1171,23 +1537,109 @@ class PhotoNormalizer:
         except Exception as e:
             self.log_handler.error(f"❌ Erreur synchronisation champs photo: {e}")
             try:
-                if layer.isEditing() and hasattr(layer, 'rollBack'):
+                if getattr(layer, 'isEditable', getattr(layer, 'isEditing', lambda: False))() and hasattr(layer, 'rollBack'):
                     layer.rollBack()
             except (NameError, AttributeError):
                 pass
             return 0
     
+    def reparer_photos_manquantes_depuis_archive(self, gpkg_file, layer_name, dcim_path=None):
+        """
+        Pour les entités dont le champ photo pointe vers un fichier absent du DCIM,
+        cherche ce fichier dans l'archive (nom exact, chaîne de renommage, ou par coordonnées) et le restaure.
+        Retourne le nombre de photos restaurées.
+        """
+        from ..scripts.analyse_orphelines import extraire_coord_du_nom
+        dcim_path = dcim_path or get_dcim_path()
+        archive_dir = self._get_archive_doublons_dir(dcim_path)
+        if not os.path.isdir(archive_dir):
+            return 0
+        archive_files = sorted(f for f in os.listdir(archive_dir) if f.lower().endswith(('.jpg', '.jpeg')))
+        if not archive_files:
+            return 0
+        import shutil
+        restored = 0
+        try:
+            layer = self.get_layer(gpkg_file, layer_name)
+            photo_idx = layer.fields().indexFromName('photo')
+            if photo_idx < 0:
+                return 0
+            for feature in layer.getFeatures():
+                photo_val = feature['photo']
+                if not photo_val or not isinstance(photo_val, str):
+                    continue
+                filename = photo_val.replace('DCIM/', '').strip()
+                if not filename.lower().endswith(('.jpg', '.jpeg')):
+                    continue
+                dcim_path_file = os.path.join(dcim_path, filename)
+                if os.path.isfile(dcim_path_file):
+                    continue
+                # Fichier absent du DCIM : chercher dans l'archive
+                cand = filename
+                if cand in archive_files:
+                    src = os.path.join(archive_dir, cand)
+                    try:
+                        shutil.copy2(src, dcim_path_file)
+                        restored += 1
+                        self.log_handler.info(f"📦 Photo restaurée depuis l'archive: {filename} (entité FID {feature.id()})")
+                    except Exception as e:
+                        self.log_handler.warning(f"⚠️  Impossible de restaurer {filename}: {e}")
+                    continue
+                # Essayer le nom après renommage (chaîne enregistrée)
+                final_name = self.log_handler.get_final_photo_name(filename)
+                if final_name and final_name != filename and final_name in archive_files:
+                    src = os.path.join(archive_dir, final_name)
+                    dest = os.path.join(dcim_path, final_name)
+                    try:
+                        shutil.copy2(src, dest)
+                        layer.startEditing()
+                        layer.changeAttributeValue(feature.id(), photo_idx, f'DCIM/{final_name}')
+                        layer.commitChanges()
+                        restored += 1
+                        self.log_handler.info(f"📦 Photo restaurée: {filename} → {final_name} (entité FID {feature.id()})")
+                    except Exception as e:
+                        self.log_handler.warning(f"⚠️  Impossible de restaurer {final_name}: {e}")
+                    continue
+                # Fallback : chercher par coordonnées (entité ou nom de fichier)
+                x_ref, y_ref = None, None
+                if feature.geometry() and not feature.geometry().isEmpty():
+                    pt = feature.geometry().asPoint()
+                    x_ref, y_ref = pt.x(), pt.y()
+                else:
+                    _, x_ref, y_ref = extraire_coord_du_nom(filename)
+                if x_ref is not None and y_ref is not None:
+                    for arch_name in archive_files:
+                        _, x_a, y_a = extraire_coord_du_nom(arch_name)
+                        if x_a is not None and y_a is not None:
+                            if abs(float(x_a) - float(x_ref)) < 0.01 and abs(float(y_a) - float(y_ref)) < 0.01:
+                                src = os.path.join(archive_dir, arch_name)
+                                dest = os.path.join(dcim_path, arch_name)
+                                try:
+                                    shutil.copy2(src, dest)
+                                    layer.startEditing()
+                                    layer.changeAttributeValue(feature.id(), photo_idx, f'DCIM/{arch_name}')
+                                    layer.commitChanges()
+                                    restored += 1
+                                    self.log_handler.info(f"📦 Photo restaurée par coords: {filename} → {arch_name} (entité FID {feature.id()})")
+                                except Exception as e:
+                                    self.log_handler.warning(f"⚠️  Impossible de restaurer {arch_name}: {e}")
+                                break
+        except Exception as e:
+            self.log_handler.error(f"❌ Erreur réparation depuis archive: {e}")
+        return restored
+    
     def clean_inconsistent_photo_fields(self, gpkg_file, layer_name):
         """
-        Vide le champ 'photo' des entités dont le FID dans le nom de fichier
-        (DT_YYYY-MM-DD_FID_...) ne correspond pas au FID réel de l'entité.
+        Vide le champ 'photo' des entités dans les cas suivants :
+        1) FID dans le nom de fichier ≠ FID réel de l'entité
+        2) FID correspond mais coordonnées différentes (collision FID, ex. 555 maurin vs 555 cuenin)
         Pour les fichiers orphelins ainsi créés :
-        - Si une entité existe aux mêmes coordonnées → supprime le fichier orphelin (doublon)
+        - Si une entité existe aux mêmes coordonnées → associer ou supprimer doublon
         - Sinon → crée une nouvelle entité pour la photo orpheline
         Retourne le nombre d'entités modifiées.
         """
         self.log_handler.info("🔍 Recherche des champs photo incohérents (FID nom ≠ FID entité)...")
-        dcim_path = "/home/e357/Qfield/cloud/DataTerrain/DCIM"
+        dcim_path = get_dcim_path()
         layer = self.get_layer(gpkg_file, layer_name)
         photo_idx = layer.fields().indexFromName('photo')
         if photo_idx < 0:
@@ -1196,6 +1648,7 @@ class PhotoNormalizer:
         
         from ..scripts.analyse_orphelines import extraire_coord_du_nom
         
+        TOL = 0.02  # tolérance coordonnées (aligné avec reconcilier_photos)
         updated = 0
         fichiers_orphelins = []  # Liste des fichiers qui deviennent orphelins
         
@@ -1204,21 +1657,39 @@ class PhotoNormalizer:
             photo_val = feature['photo']
             if not photo_val or not isinstance(photo_val, str):
                 continue
-            filename = photo_val.replace('DCIM/', '').strip()
+            filename = photo_val.replace('DCIM/', '').strip().split('/')[-1]
             fid_in_name = self._fid_depuis_nom_photo(filename)
             if fid_in_name is None:
                 continue
+            # Incohérence 1: FID dans le nom ≠ FID de l'entité
             if fid_in_name != feature.id():
                 self.log_handler.warning(
                     f"⚠️  Incohérence FID pour entité {feature.id()}: "
                     f"champ photo → {filename} (FID {fid_in_name})"
                 )
-                # Extraire les coordonnées du fichier orphelin
                 _, x_orphan, y_orphan = extraire_coord_du_nom(filename)
                 if x_orphan is not None and y_orphan is not None:
-                    fichiers_orphelins.append((filename, x_orphan, y_orphan, feature.id()))
+                    if not any(f[0] == filename for f in fichiers_orphelins):
+                        fichiers_orphelins.append((filename, x_orphan, y_orphan, feature.id()))
                 layer.changeAttributeValue(feature.id(), photo_idx, None)
                 updated += 1
+                continue
+            # Incohérence 2: FID correspond mais coordonnées différentes (collision FID, ex. 555 maurin vs 555 cuenin)
+            _, x_photo, y_photo = extraire_coord_du_nom(filename)
+            if x_photo is not None and y_photo is not None:
+                geom = feature.geometry()
+                if geom and not geom.isEmpty():
+                    pt = geom.asPoint()
+                    if abs(pt.x() - float(x_photo)) >= TOL or abs(pt.y() - float(y_photo)) >= TOL:
+                        self.log_handler.warning(
+                            f"⚠️  Collision FID pour entité {feature.id()}: champ photo → {filename} "
+                            f"(coords photo: {x_photo:.2f},{y_photo:.2f} ≠ entité: {pt.x():.2f},{pt.y():.2f})"
+                        )
+                        # Éviter doublon si le même fichier est référencé par plusieurs entités
+                        if not any(f[0] == filename for f in fichiers_orphelins):
+                            fichiers_orphelins.append((filename, float(x_photo), float(y_photo), feature.id()))
+                        layer.changeAttributeValue(feature.id(), photo_idx, None)
+                        updated += 1
         layer.commitChanges()
         
         # Traiter les fichiers orphelins
@@ -1246,16 +1717,12 @@ class PhotoNormalizer:
                     # Une entité existe aux mêmes coordonnées
                     photo_existante = entite_existante_meme_coord['photo']
                     if photo_existante and isinstance(photo_existante, str):
-                        # L'entité a déjà une photo valide → supprimer le doublon
-                        try:
-                            os.remove(file_path)
+                        # L'entité a déjà une photo valide → supprimer ou archiver le doublon
+                        if self._supprimer_ou_archiver_doublon(
+                            file_path,
+                            f"entité FID {entite_existante_meme_coord.id()} a déjà une photo aux mêmes coordonnées",
+                        ):
                             fichiers_supprimes += 1
-                            self.log_handler.success(
-                                f"🗑️  Fichier doublon supprimé: {filename} "
-                                f"(entité FID {entite_existante_meme_coord.id()} a déjà une photo aux mêmes coordonnées)"
-                            )
-                        except Exception as e:
-                            self.log_handler.error(f"❌ Erreur suppression {filename}: {e}")
                     else:
                         # L'entité n'a pas de photo → associer ce fichier
                         layer.changeAttributeValue(entite_existante_meme_coord.id(), photo_idx, f'DCIM/{filename}')
@@ -1304,6 +1771,166 @@ class PhotoNormalizer:
                 self.log_handler.info(f"✅ {entites_creees} nouvelle(s) entité(s) créée(s) pour photos orphelines")
         
         return updated
+
+    def reconcilier_photos_avec_entites(self, gpkg_file, layer_name, dcim_path):
+        """
+        Pour chaque photo dans DCIM :
+        - Si attachée à une entité : vérifie que les coordonnées correspondent (tolérance 0.02).
+          Si non : vide le champ photo de l'entité (mauvaise association).
+        - Si non attachée : cherche une entité par FID (si dans le nom) ou par coordonnées.
+          Si trouvée : attache la photo. Sinon : crée une entité.
+        Retourne (nb_verif, nb_attachees, nb_creees).
+        """
+        from ..scripts.analyse_orphelines import extraire_coord_du_nom
+        
+        layer = self.get_layer(gpkg_file, layer_name)
+        photo_idx = layer.fields().indexFromName('photo')
+        if photo_idx < 0:
+            self.log_handler.warning("⚠️  Champ 'photo' introuvable dans la couche")
+            return 0, 0, 0
+        
+        if not os.path.exists(dcim_path):
+            self.log_handler.error(f"❌ Dossier DCIM introuvable: {dcim_path}")
+            return 0, 0, 0
+        
+        photos = [f for f in os.listdir(dcim_path) if f.lower().endswith(('.jpg', '.jpeg'))]
+        self.log_handler.info(f"📷 {len(photos)} photos à traiter dans DCIM")
+        
+        # Construire photo -> entités qui la référencent
+        photo_to_entities = {}
+        for feature in layer.getFeatures():
+            photo_val = feature['photo']
+            if not photo_val or not isinstance(photo_val, str):
+                continue
+            filename = photo_val.replace('DCIM/', '').strip().split('/')[-1]
+            if filename not in photo_to_entities:
+                photo_to_entities[filename] = []
+            photo_to_entities[filename].append(feature.id())
+        
+        TOL = 0.02
+        nb_verif, nb_attachees, nb_creees = 0, 0, 0
+        layer.startEditing()
+        
+        for photo_name in photos:
+            fid, x, y = extraire_coord_du_nom(photo_name)
+            if x is None or y is None:
+                self.log_handler.debug(f"ℹ️  Format non reconnu, ignoré: {photo_name}")
+                continue
+            
+            entity_ids = list(photo_to_entities.get(photo_name, []))
+            still_correctly_attached = False
+            
+            # Phase 1 : si attachée, vérifier les coordonnées
+            for eid in entity_ids:
+                feat = next((f for f in layer.getFeatures() if f.id() == eid), None)
+                if not feat or not feat.geometry() or feat.geometry().isEmpty():
+                    continue
+                pt = feat.geometry().asPoint()
+                if abs(pt.x() - float(x)) < TOL and abs(pt.y() - float(y)) < TOL:
+                    nb_verif += 1
+                    still_correctly_attached = True
+                else:
+                    # Mauvaise association : coordonnées ne correspondent pas
+                    self.log_handler.warning(
+                        f"⚠️  Photo {photo_name} attachée à entité FID {eid} mais coordonnées différentes "
+                        f"(photo: {x:.2f},{y:.2f} vs entité: {pt.x():.2f},{pt.y():.2f}). Champ photo vidé."
+                    )
+                    layer.changeAttributeValue(eid, photo_idx, None)
+            
+            if still_correctly_attached:
+                continue  # Photo correctement attachée, passer à la suivante
+            
+            # Phase 2 : photo non attachée → trouver ou créer entité
+            entite_trouvee = None
+            
+            # Chercher par FID si présent et != 0, MAIS vérifier que les coordonnées correspondent
+            # (évite les collisions FID : deux photos avec même FID mais sessions différentes)
+            if fid is not None and fid != 0:
+                for feature in layer.getFeatures():
+                    if feature.id() == fid and feature.geometry() and not feature.geometry().isEmpty():
+                        pt = feature.geometry().asPoint()
+                        if abs(pt.x() - float(x)) < TOL and abs(pt.y() - float(y)) < TOL:
+                            entite_trouvee = feature
+                            break
+                        # FID trouvé mais coords différentes = collision (ex. 555 maurin vs 555 cuenin)
+                        self.log_handler.debug(
+                            f"ℹ️  FID {fid} trouvé mais coords différentes (photo: {x:.2f},{y:.2f}), "
+                            f"recherche par coordonnées..."
+                        )
+                        break  # Ne pas attacher à cette entité
+            
+            # Sinon chercher par coordonnées
+            if entite_trouvee is None:
+                for feature in layer.getFeatures():
+                    if feature.geometry() and not feature.geometry().isEmpty():
+                        pt = feature.geometry().asPoint()
+                        if abs(pt.x() - float(x)) < TOL and abs(pt.y() - float(y)) < TOL:
+                            entite_trouvee = feature
+                            break
+            
+            if entite_trouvee:
+                photo_existante = entite_trouvee['photo']
+                existant = (photo_existante.split('/')[-1].strip() if photo_existante else None)
+                if existant and existant.lower() == photo_name.lower():
+                    continue  # Déjà la bonne photo
+                # Ne pas écraser si l'entité a déjà une photo valide aux mêmes coordonnées
+                if existant:
+                    existant_path = os.path.join(dcim_path, existant)
+                    if os.path.exists(existant_path):
+                        _, x_ex, y_ex = extraire_coord_du_nom(existant)
+                        if x_ex is not None and abs(float(x_ex) - float(x)) < TOL and abs(float(y_ex) - float(y)) < TOL:
+                            self.log_handler.info(
+                                f"ℹ️  Entité FID {entite_trouvee.id()} a déjà une photo valide aux mêmes coords, "
+                                f"photo orpheline {photo_name} non attachée (possible doublon)"
+                            )
+                            continue
+                # Attacher la photo
+                layer.changeAttributeValue(entite_trouvee.id(), photo_idx, f'DCIM/{photo_name}')
+                nb_attachees += 1
+                self.log_handler.success(
+                    f"✅ Photo {photo_name} attachée à entité FID {entite_trouvee.id()}"
+                )
+            else:
+                # Créer une nouvelle entité
+                try:
+                    from qgis.core import QgsFeature, QgsGeometry, QgsPointXY
+                    new_feature = QgsFeature(layer.fields())
+                    
+                    date_str = None
+                    agent, type_saisie = 'INCONNU', 'INCONNU'
+                    m_std = re.match(r'DT_(\d{4}-\d{2}-\d{2})_(\d+)_([^_]+)_([^_]+)_', photo_name)
+                    m_ancien = re.match(r'DT_(\d{4})(\d{2})(\d{2})_', photo_name)
+                    if m_std:
+                        date_str = m_std.group(1)
+                        agent = m_std.group(3).replace('_', ' ')
+                        type_saisie = m_std.group(4).replace('_', ' ')
+                    elif m_ancien:
+                        date_str = f"{m_ancien.group(1)}-{m_ancien.group(2)}-{m_ancien.group(3)}"
+                    
+                    new_feature['date_saisie'] = f"{date_str}T00:00:00" if date_str else None
+                    new_feature['x_saisie'] = float(x)
+                    new_feature['y_saisie'] = float(y)
+                    new_feature['nom_agent'] = agent
+                    new_feature['type_saisie'] = type_saisie
+                    new_feature['photo'] = f'DCIM/{photo_name}'
+                    new_feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(float(x), float(y))))
+                    
+                    if layer.addFeature(new_feature):
+                        nb_creees += 1
+                        self.log_handler.success(
+                            f"✅ Nouvelle entité créée pour photo orpheline: {photo_name}"
+                        )
+                except Exception as e:
+                    self.log_handler.error(f"❌ Erreur création entité pour {photo_name}: {e}")
+        
+        try:
+            layer.commitChanges()
+        except Exception as e:
+            self.log_handler.error(f"❌ Erreur commit: {e}")
+            if hasattr(layer, 'rollBack'):
+                layer.rollBack()
+        
+        return nb_verif, nb_attachees, nb_creees
 
     def renommer_photos(self, dcim_path, layer):
         """Renomme les photos selon le format standard"""
@@ -1543,30 +2170,28 @@ class PhotoNormalizer:
         return None
 
     def _mettre_a_jour_couche_photos(self, layer, old_name, new_name):
-        """Met à jour la référence photo uniquement pour l'entité dont le FID correspond au FID dans new_name.
-        Évite qu'une entité (ex. 538) reçoive le nom d'un fichier qui appartient à une autre (ex. 497)."""
+        """Met à jour la référence photo pour toute entité qui référence old_name.
+        Quand le nouveau nom a FID=0, les entités concernées peuvent avoir un FID différent (ex. 521, 522)
+        car l'entité a été créée aux mêmes coordonnées avant que le FID soit assigné."""
         try:
-            fid_dans_nom = self._fid_depuis_nom_photo(new_name)
-            if fid_dans_nom is None:
+            photo_idx = layer.fields().indexFromName('photo')
+            if photo_idx < 0:
                 return
+            fid_dans_nom = self._fid_depuis_nom_photo(new_name)
             layer.startEditing()
             for feature in layer.getFeatures():
                 photo_field = feature['photo']
                 if not photo_field or old_name not in photo_field:
                     continue
-                # Ne mettre à jour que si le nouveau nom de fichier correspond à cette entité (même FID)
-                if feature.id() != fid_dans_nom:
+                # Si FID dans le nouveau nom est valide et différent de l'entité, éviter les mauvaises associations
+                # (sauf quand FID=0 : la photo n'a pas encore de FID assigné, l'entité existe aux mêmes coords)
+                if fid_dans_nom is not None and fid_dans_nom != 0 and feature.id() != fid_dans_nom:
                     continue
                 new_photo_path = photo_field.replace(old_name, new_name)
-                layer.changeAttributeValue(feature.id(),
-                                         layer.fields().indexFromName('photo'),
-                                         new_photo_path)
+                layer.changeAttributeValue(feature.id(), photo_idx, new_photo_path)
                 self.log_handler.info(f"📋 Mise à jour de l'entité {feature.id()}: {old_name} → {new_name}")
-                break
             
-            # Sauvegarder les modifications
             layer.commitChanges()
-            
         except Exception as e:
             self.log_handler.error(f"Erreur lors de la mise à jour de la couche: {e}")
             if hasattr(layer, 'rollBack'):
@@ -1662,6 +2287,17 @@ class PhotoNormalizer:
                 old_path = os.path.join(dcim_path, old_name)
                 if not os.path.exists(old_path):
                     continue
+                # Vérifier que les coordonnées de la photo correspondent à l'entité (éviter mauvaises associations)
+                _, x_photo, y_photo = extraire_coord_du_nom(old_name)
+                if x_photo is not None and y_photo is not None:
+                    geom_check = feature.geometry()
+                    pt = geom_check.asPoint() if geom_check and not geom_check.isEmpty() else None
+                    if pt and (abs(pt.x() - float(x_photo)) >= 0.02 or abs(pt.y() - float(y_photo)) >= 0.02):
+                        self.log_handler.warning(
+                            f"⚠️  Entité FID {feature.id()}: photo {old_name} ignorée (coords photo "
+                            f"{x_photo:.2f},{y_photo:.2f} ≠ entité {pt.x():.2f},{pt.y():.2f})"
+                        )
+                        continue
                 nom_agent = (feature['nom_agent'] or '').strip() if feature['nom_agent'] is not None else ''
                 type_saisie = (feature['type_saisie'] or '').strip() if feature['type_saisie'] is not None else ''
                 if not nom_agent or nom_agent.upper() == 'INCONNU':
@@ -1706,22 +2342,12 @@ class PhotoNormalizer:
                         layer.changeAttributeValue(feature.id(), photo_idx, new_photo_val)
                         renamed_count += 1
                         
-                        # Si l'ancien fichier existe toujours et que c'est un doublon (mêmes coordonnées), le supprimer
+                        # Si l'ancien fichier existe toujours et que c'est un doublon (mêmes coordonnées), le supprimer ou archiver
                         if os.path.exists(old_path):
-                            # Extraire les coordonnées de l'ancien nom pour vérifier si c'est un doublon
                             _, x_old, y_old = extraire_coord_du_nom(old_name)
                             if x_old is not None and y_old is not None:
-                                # Vérifier si les coordonnées sont identiques (doublon)
                                 if abs(float(x_old) - float(x)) < 0.01 and abs(float(y_old) - float(y)) < 0.01:
-                                    try:
-                                        os.remove(old_path)
-                                        self.log_handler.success(
-                                            f"🗑️  Fichier doublon supprimé: {old_name} "
-                                            f"(mêmes coordonnées que {new_name})"
-                                        )
-                                    except Exception as e:
-                                        self.log_handler.warning(f"⚠️  Impossible de supprimer doublon {old_name}: {e}")
-                                        self.log_handler.info(f"ℹ️  Fichier {new_name} existe déjà, champ photo mis à jour (ancien fichier {old_name} toujours présent)")
+                                    self._supprimer_ou_archiver_doublon(old_path, f"mêmes coordonnées que {new_name}", dcim_path)
                                 else:
                                     self.log_handler.info(f"ℹ️  Fichier {new_name} existe déjà, champ photo mis à jour (ancien fichier {old_name} toujours présent)")
                             else:
@@ -1749,30 +2375,93 @@ class PhotoNormalizer:
             layer.commitChanges()
         except Exception as e:
             self.log_handler.error(f"❌ Erreur: {e}")
-            if layer.isEditing() and hasattr(layer, 'rollBack'):
+            if getattr(layer, 'isEditable', getattr(layer, 'isEditing', lambda: False))() and hasattr(layer, 'rollBack'):
                 layer.rollBack()
             return renamed_count
         return renamed_count
 
     def creer_entites_pour_photos_orphelines_avec_fid(self, dcim_path, layer):
-        """Crée des entités pour les photos orphelines qui ont un FID valide mais pas d'entité correspondante"""
+        """Rattache les photos orphelines aux entités existantes (champ photo) ou crée des entités si le FID n'existe pas.
+        Vérifie les coordonnées avant de rattacher par FID pour éviter les collisions (ex. 555 maurin vs 555 cuenin)."""
+        from ..scripts.analyse_orphelines import extraire_coord_du_nom
+
         self.log_handler.info("📋 Détection et création d'entités pour photos orphelines avec FID...")
         
-        # Lister les photos orphelines avec FID valide
-        photos_orphelines_avec_fid = []
-        
-        # D'abord, obtenir la liste des FID existants
+        # D'abord, obtenir la liste des FID existants et l'index du champ photo
         fid_existants = set()
         for feature in layer.getFeatures():
             fid_existants.add(feature.id())
         
+        photo_field_idx = layer.fields().indexFromName('photo')
+        if photo_field_idx < 0:
+            self.log_handler.warning("⚠️  Champ 'photo' introuvable dans la couche")
+            return 0
+        
+        TOL = 0.02  # tolérance pour coordonnées (aligné avec reconcilier_photos_avec_entites)
+        
+        # 1) Rattacher les photos dont le FID existe déjà : remplir le champ photo de l'entité (plus d'orphelines)
+        # Vérification des coordonnées obligatoire pour éviter les collisions FID (sessions différentes)
+        rattachees = 0
+        layer.startEditing()
+        for filename in os.listdir(dcim_path):
+            if not filename.lower().endswith(('.jpg', '.jpeg')):
+                continue
+            fid = self._fid_depuis_nom_photo(filename)
+            if fid is None or fid not in fid_existants:
+                continue
+            # Extraire les coordonnées de la photo pour vérification
+            _, x_photo, y_photo = extraire_coord_du_nom(filename)
+            if x_photo is None or y_photo is None:
+                self.log_handler.debug(f"ℹ️  Photo {filename}: format sans coordonnées, ignorée pour rattachement par FID")
+                continue
+            # Entité existante pour ce FID : vérifier si la photo est déjà associée
+            feature = None
+            for f in layer.getFeatures():
+                if f.id() == fid:
+                    feature = f
+                    break
+            if not feature:
+                continue
+            # Vérifier que les coordonnées de l'entité correspondent à celles de la photo
+            geom = feature.geometry()
+            if not geom or geom.isEmpty():
+                self.log_handler.debug(f"ℹ️  Entité FID {fid}: pas de géométrie, rattachement par FID ignoré (éviter collision)")
+                continue
+            pt = geom.asPoint()
+            if abs(pt.x() - float(x_photo)) >= TOL or abs(pt.y() - float(y_photo)) >= TOL:
+                self.log_handler.debug(
+                    f"ℹ️  Photo {filename} (FID {fid}): coordonnées différentes "
+                    f"(photo: {x_photo:.2f},{y_photo:.2f} vs entité: {pt.x():.2f},{pt.y():.2f}), "
+                    f"rattachement ignoré (collision FID)"
+                )
+                continue
+            photo_val = feature['photo']
+            current = (photo_val.split('/')[-1].strip() if photo_val and isinstance(photo_val, str) else None)
+            if current and current.lower() == filename.lower():
+                continue
+            # Rattacher cette photo à l'entité (coordonnées vérifiées)
+            layer.changeAttributeValue(fid, photo_field_idx, f'DCIM/{filename}')
+            rattachees += 1
+            self.log_handler.info(f"  Entité FID {fid}: champ photo rattaché → {filename}")
+        if rattachees:
+            try:
+                layer.commitChanges()
+                self.log_handler.info(f"✅ {rattachees} photo(s) orpheline(s) rattachée(s) à une entité existante (champ photo rempli)")
+            except Exception as e:
+                self.log_handler.error(f"❌ Erreur commit rattachement: {e}")
+                if hasattr(layer, 'rollBack'):
+                    layer.rollBack()
+        else:
+            if getattr(layer, 'isEditable', getattr(layer, 'isEditing', lambda: False))() and hasattr(layer, 'rollBack'):
+                layer.rollBack()
+        
+        # 2) Lister les photos orphelines avec FID valide mais pas d'entité correspondante (création)
+        photos_orphelines_avec_fid = []
         for filename in os.listdir(dcim_path):
             if filename.lower().endswith('.jpg'):
-                # Vérifier si la photo a un FID mais pas d'entité correspondante
                 match = re.match(r'DT_(\d{4}-\d{2}-\d{2})_(\d+)_([^_]+)_([^_]+)_([-+]?\d+\.?\d*)_([-+]?\d+\.?\d*)\.jpg', filename)
                 if match:
                     fid = int(match.group(2))
-                    # Vérifier si ce FID n'existe pas dans la couche
                     if fid not in fid_existants:
                         date_str = match.group(1)
                         agent = match.group(3).replace('_', ' ')
@@ -1782,8 +2471,9 @@ class PhotoNormalizer:
                         photos_orphelines_avec_fid.append((filename, date_str, fid, agent, type_saisie, x, y))
         
         if not photos_orphelines_avec_fid:
-            self.log_handler.info("ℹ️  Aucune photo orpheline avec FID valide nécessitant création d'entité")
-            self.log_handler.info("   (Les orphelines listées en analyse ont déjà une entité pour ce FID ; le champ photo peut être vide ou pointer ailleurs.)")
+            if rattachees == 0:
+                self.log_handler.info("ℹ️  Aucune photo orpheline avec FID nécessitant traitement (toutes déjà rattachées ou sans FID valide)")
+            # Retourner 0 pour ne pas afficher "X entités créées" (on a seulement rattaché des photos)
             return 0
         
         self.log_handler.warning(f"⚠️  {len(photos_orphelines_avec_fid)} photos orphelines avec FID à traiter")
@@ -1812,18 +2502,33 @@ class PhotoNormalizer:
                     # Une entité existe déjà aux mêmes coordonnées
                     photo_existante = entite_existante_meme_coord['photo']
                     file_path = os.path.join(dcim_path, photo_name)
+                    existant_filename = (photo_existante.split('/')[-1].strip() if photo_existante and isinstance(photo_existante, str) else None)
+                    existant_path = os.path.join(dcim_path, existant_filename) if existant_filename else None
                     
                     if photo_existante and isinstance(photo_existante, str):
-                        # L'entité a déjà une photo → supprimer le doublon
-                        if os.path.exists(file_path):
-                            try:
-                                os.remove(file_path)
-                                self.log_handler.success(
-                                    f"🗑️  Photo doublon supprimée: {photo_name} "
-                                    f"(entité FID {entite_existante_meme_coord.id()} existe déjà aux mêmes coordonnées)"
-                                )
-                            except Exception as e:
-                                self.log_handler.error(f"❌ Erreur suppression doublon {photo_name}: {e}")
+                        # Vérifier si la photo actuelle de l'entité existe réellement (DCIM ou archive)
+                        archive_dir = self._get_archive_doublons_dir(dcim_path)
+                        existant_dans_archive = (os.path.isfile(os.path.join(archive_dir, existant_filename)) if existant_filename and os.path.exists(archive_dir) else False)
+                        if not existant_path or (not os.path.exists(existant_path) and not existant_dans_archive):
+                            # La photo référencée n'existe pas : mettre à jour l'entité avec notre fichier au lieu d'archiver
+                            if os.path.exists(file_path):
+                                try:
+                                    layer.startEditing()
+                                    layer.changeAttributeValue(entite_existante_meme_coord.id(), photo_field_idx, f'DCIM/{photo_name}')
+                                    layer.commitChanges()
+                                    self.log_handler.success(
+                                        f"✅ Entité FID {entite_existante_meme_coord.id()}: champ photo mis à jour "
+                                        f"({existant_filename or 'vide'} → {photo_name})"
+                                    )
+                                except Exception as e:
+                                    self.log_handler.error(f"❌ Erreur mise à jour entité {entite_existante_meme_coord.id()}: {e}")
+                            continue
+                        # L'entité a déjà une photo valide → supprimer ou archiver le doublon
+                        self._supprimer_ou_archiver_doublon(
+                            file_path,
+                            f"entité FID {entite_existante_meme_coord.id()} existe déjà aux mêmes coordonnées",
+                            dcim_path,
+                        )
                         continue
                     else:
                         # L'entité n'a pas de photo → associer ce fichier
@@ -1906,12 +2611,12 @@ class PhotoNormalizer:
                     
             except Exception as e:
                 self.log_handler.error(f"❌ Erreur création entité pour {photo_name}: {e}")
-                if layer.isEditing():
+                if getattr(layer, 'isEditable', getattr(layer, 'isEditing', lambda: False))():
                     if hasattr(layer, 'rollBack'):
                         layer.rollBack()
         
         # Sauvegarder les modifications finales si on est encore en édition
-        if layer.isEditing():
+        if getattr(layer, 'isEditable', getattr(layer, 'isEditing', lambda: False))():
             layer.commitChanges()
         self.log_handler.success(f"✅ {entites_creees}/{len(photos_orphelines_avec_fid)} entités créées pour photos orphelines avec FID")
         return entites_creees
@@ -1982,16 +2687,12 @@ class PhotoNormalizer:
                         photo_existante = existing_feature['photo'] if existing_feature else None
                         
                         if photo_existante and isinstance(photo_existante, str) and photo_existante.strip():
-                            # L'entité a déjà une photo valide → supprimer le doublon
-                            if os.path.exists(file_path):
-                                try:
-                                    os.remove(file_path)
-                                    self.log_handler.success(
-                                        f"🗑️  Photo doublon supprimée: {photo_name} "
-                                        f"(entité FID {existing_fid} a déjà une photo aux mêmes coordonnées)"
-                                    )
-                                except Exception as e:
-                                    self.log_handler.error(f"❌ Erreur suppression doublon {photo_name}: {e}")
+                            # L'entité a déjà une photo valide → supprimer ou archiver le doublon
+                            self._supprimer_ou_archiver_doublon(
+                                file_path,
+                                f"entité FID {existing_fid} a déjà une photo aux mêmes coordonnées",
+                                dcim_path,
+                            )
                             continue
                         else:
                             # L'entité n'a pas de photo → associer ce fichier ou renommer selon le cas

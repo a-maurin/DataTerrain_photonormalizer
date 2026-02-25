@@ -2,17 +2,24 @@
 
 import logging
 import os
+import sys
 
-# Configuration du logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/tmp/' + os.path.basename(__file__).replace('.py', '.log')),
-        logging.StreamHandler()
-    ]
-)
+# Import de la config des chemins (compatible exécution depuis QGIS ou standalone)
+try:
+    from ..core.project_config import get_dcim_path, get_gpkg_path
+except ImportError:
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from core.project_config import get_dcim_path, get_gpkg_path
+
+# Configuration du logging (sans FileHandler pour éviter ResourceWarning de fichier non fermé)
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 """
 Script de détection des photos non référencées
@@ -28,9 +35,9 @@ def detect_unreferenced_photos(log_handler, export_dir):
         log_handler: Handler pour afficher les messages
         export_dir: Dossier pour exporter les résultats
     """
-    # Chemins par défaut
-    dcim_path = "/home/e357/Qfield/cloud/DataTerrain/DCIM"
-    gpkg_file = "/home/e357/Qfield/cloud/DataTerrain/donnees_terrain.gpkg"
+    # Chemins depuis la config centralisée (Linux / Windows)
+    dcim_path = get_dcim_path()
+    gpkg_file = get_gpkg_path()
     layer_name = "saisies_terrain"
     
     log_handler.info(f"🔍 Détection des photos non référencées")
@@ -81,20 +88,25 @@ def detect_unreferenced_photos(log_handler, export_dir):
             else:
                 photos_with_null += 1
         
-        log_handler.info(f"📋 Trouvé {len(referenced_photos)} photos référencées")
+        log_handler.info(f"📋 Trouvé {len(referenced_photos)} photos référencées (liées à au moins une entité)")
         if photos_with_null > 0:
-            log_handler.info(f"⚠️  {photos_with_null} entités ont un champ photo vide")
+            log_handler.info(
+                f"ℹ️  {photos_with_null} entités n'ont pas de photo associée "
+                "(normal : la saisie terrain n'inclut pas toujours une photo)."
+            )
         
     except Exception as e:
         log_handler.error(f"❌ Erreur lecture couche : {e}")
         return False
     
-    # Trouver les photos non référencées (présentes dans DCIM mais pas dans le champ photo des entités)
+    # Comparaison insensible à la casse (.jpg vs .JPG)
     set_referenced = set(referenced_photos)
-    unreferenced = [p for p in dcim_photos if p not in set_referenced]
+    set_referenced_lower = {p.lower() for p in set_referenced}
+    unreferenced = [p for p in dcim_photos if p.lower() not in set_referenced_lower]
     
     # Photos référencées en base mais absentes du DCIM (entités pointant vers un fichier supprimé/renommé)
-    referenced_but_missing = set_referenced - set(dcim_photos)
+    dcim_lower = {p.lower() for p in dcim_photos}
+    referenced_but_missing = {r for r in set_referenced if r.lower() not in dcim_lower}
     
     debug_info = f"DEBUG: Photos uniques dans referenced_photos: {len(set_referenced)}"
     log_handler.debug(debug_info)
@@ -107,6 +119,11 @@ def detect_unreferenced_photos(log_handler, export_dir):
         log_handler.info(f"  • Référencées en base mais absentes du DCIM: {len(referenced_but_missing)}")
     
     if unreferenced:
+        log_handler.info(
+            "ℹ️  Règle : toutes les photos doivent être rattachées à une entité ; une entité peut en revanche ne pas avoir de photo. "
+            "Une photo « non référencée » est une photo dans DCIM qui n'est référencée par aucune entité. "
+            "Le mode complet ou les modes orphelines permettent soit de rattacher la photo à une entité existante (si le nom de la photo contient le FID de cette entité), soit de créer une nouvelle entité associée à la photo."
+        )
         log_handler.info(f"📋 Photos non référencées ({len(unreferenced)}):")
         for photo in unreferenced[:5]:
             log_handler.info(f"  • {photo}")

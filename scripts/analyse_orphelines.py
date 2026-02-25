@@ -3,23 +3,30 @@
 import logging
 import os
 
-# Configuration du logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/tmp/' + os.path.basename(__file__).replace('.py', '.log')),
-        logging.StreamHandler()
-    ]
-)
+# Configuration du logging (sans FileHandler pour éviter ResourceWarning de fichier non fermé)
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 """
 Script d'analyse des photos orphelines intégré au nouveau système
 """
 
 import re
+import sys
 from qgis.core import QgsVectorLayer
+
+try:
+    from ..core.project_config import get_dcim_path, get_gpkg_path
+except ImportError:
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from core.project_config import get_dcim_path, get_gpkg_path
+
 
 def extraire_coord_du_nom(nom_fichier):
     """
@@ -58,11 +65,10 @@ def analyser_photos_orphelines(log_handler):
         log_handler: Handler pour afficher les messages et logs
     """
     
-    # Configuration (même source que le normalizer : GeoPackage + table saisies_terrain)
-    gpkg_file = "/home/e357/Qfield/cloud/DataTerrain/donnees_terrain.gpkg"
+    # Configuration (config centralisée Linux / Windows)
+    gpkg_file = get_gpkg_path()
     layer_name = "saisies_terrain"
-    base_path = "/home/e357/Qfield/cloud/DataTerrain"
-    dcim = os.path.join(base_path, "DCIM")
+    dcim = get_dcim_path()
     
     log_handler.info("🔍 Analyse des photos orphelines en cours...")
     

@@ -3,16 +3,13 @@
 import logging
 import os
 
-# Configuration du logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/tmp/' + os.path.basename(__file__).replace('.py', '.log')),
-        logging.StreamHandler()
-    ]
-)
+# Configuration du logging (sans FileHandler pour éviter ResourceWarning de fichier non fermé)
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 """
 Script pour corriger les photos avec FID=0
@@ -20,15 +17,25 @@ Ce script trouve les photos avec FID=0 et les renomme avec un FID valide
 """
 
 import re
+import sys
 from qgis.core import QgsProject, QgsVectorLayer, QgsFeature, QgsGeometry, QgsPointXY
+
+try:
+    from ..core.project_config import get_dcim_path, get_gpkg_path
+except ImportError:
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from core.project_config import get_dcim_path, get_gpkg_path
+
 
 def correct_fid_zero_photos():
     """Corrige les photos avec FID=0"""
     logger.info("=== CORRECTION DES PHOTOS AVEC FID=0 ===")
     
-    # Configuration
-    dcim_path = "/home/e357/Qfield/cloud/DataTerrain/DCIM"
-    gpkg_file = "/home/e357/Qfield/cloud/DataTerrain/donnees_terrain.gpkg"
+    # Configuration (config centralisée Linux / Windows)
+    dcim_path = get_dcim_path()
+    gpkg_file = get_gpkg_path()
     layer_name = "saisies_terrain"
     
     # Vérifier les chemins

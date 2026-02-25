@@ -14,13 +14,15 @@ build/
 .venv/
 venv/
 env/
+ENV/
 
 # Logs et exports générés par le plugin
 logs/*.log
+logs/*.txt
 exports/*.log
 exports/*.txt
-!exports/.gitkeep
 !logs/.gitkeep
+!exports/.gitkeep
 
 # Fichiers IDE / éditeur
 .idea/
@@ -28,12 +30,28 @@ exports/*.txt
 *.swp
 *.swo
 *~
+.project
+.pydevproject
+.settings/
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Fichiers de config locaux (si vous en ajoutez)
+# Fichiers de config locaux
 *.local
 .env
 .env.local
+
+# Fichiers temporaires
+*.tmp
+*.bak
+*.backup
+
+# Archives de sauvegarde (générées par le plugin)
+*.gpkg.backup
+*_backup_*
+
+# Dossiers d'archive générés
+DataTerrain_DCIM_archive_doublons/

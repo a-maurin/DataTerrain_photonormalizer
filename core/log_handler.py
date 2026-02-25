@@ -589,7 +589,7 @@ class LogWindow(QDialog):
         section_analyse = self._create_section_group("Analyse et détection", self.colors['primary'])
         section_analyse.layout().addWidget(self.create_mode_card(
             "Détection des photos non référencées",
-            "Identifie les photos du DCIM non liées à une entité dans le GeoPackage. Génère un rapport dans exports/.",
+            "Identifie les photos du DCIM qui ne sont rattachées à aucune entité (toutes les photos doivent l'être ; les entités peuvent ne pas avoir de photo). Génère un rapport dans exports/.",
             self.get_icon_path('iconDetection_colored.svg'),
             self.colors['primary'],
             "detection",
@@ -601,6 +601,14 @@ class LogWindow(QDialog):
             self.get_icon_path('iconDoublons_new.svg'),
             self.colors['danger'],
             "duplicate_detection",
+            compact=True
+        ))
+        section_analyse.layout().addWidget(self.create_mode_card(
+            "Analyse complète de la table attributaire",
+            "Analyse tous les champs de la table attributaire : structure, statistiques, valeurs, cohérences et exporte un rapport détaillé.",
+            self.get_icon_path('iconDetection_colored.svg'),
+            self.colors['info'],
+            "analyse_table",
             compact=True
         ))
         self.advanced_modes.append(section_analyse)
@@ -624,6 +632,14 @@ class LogWindow(QDialog):
             self.get_icon_path('iconCorrectionFID.svg'),
             self.colors['secondary'],
             "clean_photos",
+            compact=True
+        ))
+        section_coherence.layout().addWidget(self.create_mode_card(
+            "Réconcilier photos et entités",
+            "Pour chaque photo : vérifie les coordonnées si attachée ; sinon attache à l'entité correspondante (FID ou coords) ou crée une entité.",
+            self.get_icon_path('iconOrphelines_colored.svg'),
+            self.colors['info'],
+            "reconcilier_photos",
             compact=True
         ))
         self.advanced_modes.append(section_coherence)
@@ -717,6 +733,8 @@ class LogWindow(QDialog):
             "photos_orphelines_fid": self.colors['warning'],
             "renommage_formulaires": self.colors['info'],
             "clean_photos": self.colors['secondary'],
+            "reconcilier_photos": self.colors['info'],
+            "analyse_table": self.colors['info'],
         }
         
         color = mode_colors.get(mode, self.colors['primary'])
@@ -743,6 +761,8 @@ class LogWindow(QDialog):
             "photos_orphelines_fid": "Créer entités pour photos avec FID",
             "renommage_formulaires": "Renommer d'après les formulaires",
             "clean_photos": "Nettoyer champs photo incohérents",
+            "reconcilier_photos": "Réconcilier photos et entités",
+            "analyse_table": "Analyse complète de la table attributaire",
         }
         return mode_names.get(mode, mode)
     
@@ -750,7 +770,7 @@ class LogWindow(QDialog):
         """Retourne une description courte du mode"""
         descriptions = {
             "normal": "Enchaîne toutes les étapes avec sauvegardes automatiques.",
-            "detection": "Identifie les photos DCIM sans entité dans le GeoPackage.",
+            "detection": "Identifie les photos DCIM non rattachées à une entité (toutes les photos doivent l'être).",
             "duplicate_detection": "Détecte les doublons et permet de les supprimer.",
             "renommage": "Renomme les photos au format DT_YYYY-MM-DD_FID_AGENT_TYPE_X_Y.jpg.",
             "optimisation": "Redimensionne et compresse les images (irréversible).",
@@ -759,6 +779,8 @@ class LogWindow(QDialog):
             "photos_orphelines_fid": "Crée les entités manquantes pour les photos avec FID valide.",
             "renommage_formulaires": "Met à jour les noms des photos d'après nom_agent et type_saisie.",
             "clean_photos": "Vide les champs photo incohérents ; gère les orphelins (doublons ou nouvelle entité).",
+            "reconcilier_photos": "Pour chaque photo : vérifie les coordonnées si attachée ; sinon attache ou crée une entité.",
+            "analyse_table": "Analyse tous les champs de la table attributaire : structure, statistiques, valeurs, cohérences et exporte un rapport détaillé.",
         }
         return descriptions.get(mode, "")
     

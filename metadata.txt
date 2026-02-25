@@ -1,9 +1,18 @@
 [general]
-icon=icon.png
 name=DataTerrain_photonormalizer
-description=Normalise les photos pour QField Cloud (renommage, redimensionnement, nettoyage)
-version=1.0
 qgisMinimumVersion=3.16
-author=Aguirre MAURIN [OBF - sd_21]
+qgisMaximumVersion=
+version=1.0.0
+description=Plugin QGIS pour la normalisation et la gestion des photos de terrain collectées via QField Cloud. Détection des photos non référencées, des doublons, analyse des orphelines, renommage automatique, création d'entités et optimisation des images.
+about=Outil complet pour standardiser et gérer les photos liées à une couche QField Cloud. Permet de détecter les incohérences, les doublons, et d'automatiser le renommage et l'organisation des photos de terrain.
+author=Aguirre MAURIN [OFB - sd_21]
 email=aguirre.maurin@ofb.gouv.fr
-about=Outil pour standardiser les photos liées à une couche QField Cloud.
+icon=icon.png
+category=Plugins
+tags=QField,photos,normalisation,doublons,orphelines,renommage,optimisation
+homepage=
+repository=https://github.com/OFB-sd21/DataTerrain_photonormalizer
+tracker=
+changelog=
+experimental=False
+deprecated=False

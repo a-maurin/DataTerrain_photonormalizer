@@ -624,6 +624,16 @@ class DoublonsDialog(QDialog):
         for photo_name in files_to_delete:
             photo_path = os.path.join(self.dcim_path, photo_name)
             
+            # AVANT suppression : vérifier si une entité référence cette photo
+            # Si oui, mettre à jour l'entité vers une photo conservée du même groupe (ne jamais supprimer d'entité)
+            redirect_ok = self._rediriger_entites_vers_photo_conservee(photo_name, files_to_delete)
+            if not redirect_ok:
+                self.log_handler.warning(
+                    f"⚠️ Photo {photo_name} référencée par une entité : suppression annulée pour éviter la perte de données."
+                )
+                errors.append(f"Référencée par une entité (conservée): {photo_name}")
+                continue
+            
             # Log l'opération de suppression
             op_id = self.log_handler.log_photo_operation(
                 "DELETE", photo_name, photo_path, None,
@@ -662,9 +672,6 @@ class DoublonsDialog(QDialog):
                         success=True,
                         context=f"Suppression doublon réussie: {photo_name}"
                     )
-                    
-                    # Supprimer les entités associées (si elles existent)
-                    self.delete_associated_entities(photo_name)
                 else:
                     error_msg = f"Fichier introuvable: {photo_name}"
                     errors.append(error_msg)
@@ -700,8 +707,12 @@ class DoublonsDialog(QDialog):
         
         # Afficher le résultat
         result_msg = f"{len(deleted_files)} fichier(s) supprimé(s) avec succès."
-        if errors:
-            result_msg += f"\n{len(errors)} erreur(s) rencontrée(s)."
+        blocked = [e for e in errors if "Référencée par une entité" in e]
+        if blocked:
+            result_msg += f"\n\n⚠️ {len(blocked)} photo(s) non supprimée(s) : référencée(s) par une entité (données protégées)."
+        other_errors = [e for e in errors if e not in blocked]
+        if other_errors:
+            result_msg += f"\n{len(other_errors)} autre(s) erreur(s) rencontrée(s)."
         
         QMessageBox.information(self, "Résultat", result_msg)
         
@@ -711,50 +722,75 @@ class DoublonsDialog(QDialog):
         # Fermer la dialogue
         self.accept()
     
-    def delete_associated_entities(self, photo_name):
-        """Supprime les entités associées à une photo"""
+    def _entites_referencant_photo(self, photo_name):
+        """Retourne la liste des FID des entités dont le champ photo référence photo_name."""
         try:
             from qgis.core import QgsVectorLayer
-            
-            # Charger la couche depuis le GeoPackage (même source que le normalizer)
             gpkg_file = os.path.join(os.path.dirname(self.dcim_path), "donnees_terrain.gpkg")
             layer_name = "saisies_terrain"
             layer = QgsVectorLayer(f"{gpkg_file}|layername={layer_name}", layer_name, "ogr")
-            
             if not layer.isValid():
-                self.log_handler.warning(f"⚠️  Couche '{layer_name}' non trouvée dans {gpkg_file}")
-                return
-            
-            # Démarrer l'édition
-            layer.startEditing()
-            
-            # Trouver et supprimer les entités qui référencent cette photo
-            entities_to_delete = []
+                return []
+            fids = []
             for feature in layer.getFeatures():
                 photo_field = feature['photo']
                 if photo_field and photo_name in photo_field:
-                    entities_to_delete.append(feature.id())
-                    self.log_handler.info(f"🗑️  Entité {feature.id()} associée à {photo_name} trouvée")
-            
-            if entities_to_delete:
-                # Supprimer les entités
-                success = layer.deleteFeatures(entities_to_delete)
-                if success:
-                    layer.commitChanges()
-                    self.log_handler.info(f"✅ {len(entities_to_delete)} entité(s) associée(s) supprimée(s)")
-                else:
-                    if hasattr(layer, 'rollBack'):
-                        layer.rollBack()
-                    self.log_handler.error(f"❌ Échec de la suppression des entités associées")
-            else:
-                self.log_handler.info(f"ℹ️  Aucune entité associée à {photo_name}")
-                if hasattr(layer, 'rollBack'):
-                    layer.rollBack()
-                
+                    fids.append(feature.id())
+            return fids
+        except Exception:
+            return []
+
+    def _rediriger_entites_vers_photo_conservee(self, photo_name, files_to_delete):
+        """
+        Si des entités référencent photo_name, les rediriger vers une photo conservée du même groupe.
+        Retourne True si la suppression peut avoir lieu (aucune entité ou redirection réussie).
+        Retourne False si une entité référence cette photo et qu'on ne peut pas la rediriger.
+        """
+        fids = self._entites_referencant_photo(photo_name)
+        if not fids:
+            return True
+        
+        # Trouver une photo conservée du même groupe (une photo du groupe qu'on ne supprime pas)
+        photo_conservee = None
+        for group_id, photos in self.selection.items():
+            if photo_name in photos:
+                for p in photos.keys():
+                    if p != photo_name and p not in files_to_delete and os.path.exists(os.path.join(self.dcim_path, p)):
+                        photo_conservee = p
+                        break
+                break
+        
+        if not photo_conservee:
+            self.log_handler.warning(
+                f"⚠️ Entité(s) {fids} référencent {photo_name} mais aucune photo conservée dans le groupe. "
+                "Suppression annulée."
+            )
+            return False
+        
+        try:
+            from qgis.core import QgsVectorLayer
+            gpkg_file = os.path.join(os.path.dirname(self.dcim_path), "donnees_terrain.gpkg")
+            layer_name = "saisies_terrain"
+            layer = QgsVectorLayer(f"{gpkg_file}|layername={layer_name}", layer_name, "ogr")
+            if not layer.isValid():
+                return False
+            photo_idx = layer.fields().indexFromName('photo')
+            if photo_idx < 0:
+                return False
+            new_val = f"DCIM/{photo_conservee}" if "DCIM/" not in photo_conservee else photo_conservee
+            if "DCIM/" not in new_val:
+                new_val = f"DCIM/{photo_conservee}"
+            layer.startEditing()
+            for fid in fids:
+                layer.changeAttributeValue(fid, photo_idx, new_val)
+                self.log_handler.info(
+                    f"📋 Entité FID {fid}: champ photo redirigé vers {photo_conservee} (avant suppression du doublon)"
+                )
+            layer.commitChanges()
+            return True
         except Exception as e:
-            self.log_handler.error(f"❌ Erreur suppression entités associées à {photo_name}: {e}")
-            import traceback
-            self.log_handler.error(f"Détails: {traceback.format_exc()}")
+            self.log_handler.error(f"❌ Erreur redirection entités: {e}")
+            return False
     
     def open_file_location(self, file_path):
         """Ouvre l'emplacement du fichier dans le gestionnaire de fichiers"""
