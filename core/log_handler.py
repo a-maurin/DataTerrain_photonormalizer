@@ -3,10 +3,10 @@
 Gestion des logs pour le plugin PhotoNormalizer
 """
 
-from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QTextEdit, QPushButton, 
-                                QHBoxLayout, QLabel, QComboBox, QFrame, QSizePolicy, QGridLayout, 
+from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QTextEdit, QPushButton,
+                                QHBoxLayout, QLabel, QComboBox, QFrame, QSizePolicy, QGridLayout,
                                 QScrollBar, QCheckBox, QGroupBox, QScrollArea, QWidget, QSpacerItem, QApplication)
-from qgis.PyQt.QtCore import Qt, pyqtSignal, QSize, QDateTime, QTimer
+from qgis.PyQt.QtCore import Qt, pyqtSignal, QSize, QDateTime
 from qgis.PyQt.QtGui import QTextOption, QIcon, QTextCursor, QFont, QPalette, QPixmap
 import os
 
@@ -21,15 +21,21 @@ class LogWindow(QDialog):
         self.setup_styles()  # Configurer les styles en premier
         self.setup_ui()
         self.selected_mode = None
-        
+        self._configure_paths_callback = None
+
+    def set_configure_paths_callback(self, callback):
+        """Callback sans argument : ouvre la configuration du dossier DataTerrain (plugin)."""
+        self._configure_paths_callback = callback
 
     def smooth_scroll_to_bottom(self):
         """Fait défiler la console vers le bas de manière fluide"""
         scrollbar = self.log_text.verticalScrollBar()
         max_value = scrollbar.maximum()
-        
-        # Animation de défilement fluide
-        for i in range(0, max_value + 1, max_value // 10):
+        if max_value <= 0:
+            scrollbar.setValue(0)
+            return
+        step = max(1, max_value // 10)
+        for i in range(0, max_value + 1, step):
             scrollbar.setValue(i)
             QApplication.processEvents()
         scrollbar.setValue(max_value)
@@ -299,7 +305,26 @@ class LogWindow(QDialog):
         header_layout.addWidget(logo_label)
         header_layout.addLayout(title_layout)
         header_layout.addStretch()
-        
+
+        folder_btn = QPushButton("📁")
+        folder_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 16px;
+                padding: 0 8px;
+                background-color: #16a085;
+                color: white;
+                border-radius: 12px;
+            }
+            QPushButton:hover {
+                background-color: #138d75;
+            }
+        """)
+        folder_btn.setToolTip(
+            "Choisir le dossier DataTerrain (contient DCIM/ et donnees_terrain.gpkg)"
+        )
+        folder_btn.clicked.connect(self._on_configure_folder_clicked)
+        header_layout.addWidget(folder_btn)
+
         # Bouton d'aide
         help_btn = QPushButton("❓")
         help_btn.setStyleSheet("""
@@ -833,24 +858,10 @@ class LogWindow(QDialog):
             icon = QIcon(self.get_default_icon_path())
         return icon
 
-    def log_message(self, message, level="INFO"):
-        """Ajoute un message au log avec couleur"""
-        colors = {
-            "INFO": "#00d2ff",
-            "WARNING": "#f39c12",
-            "ERROR": "#e74c3c",
-            "SUCCESS": "#2ecc71",
-            "DEBUG": "#95a5a6"
-        }
-        
-        color = colors.get(level, "#ffffff")
-        html_message = f'<span style="color:{color}; font-family: Courier New;">{message}</span>'
-        
-        cursor = self.log_text.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertHtml(html_message + '<br>')
-        self.log_text.ensureCursorVisible()
-    
+    def _on_configure_folder_clicked(self):
+        if self._configure_paths_callback:
+            self._configure_paths_callback()
+
     def clear_logs(self):
         """Efface les logs"""
         self.log_text.clear()

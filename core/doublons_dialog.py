@@ -6,6 +6,8 @@ Permet à l'utilisateur de sélectionner quels doublons supprimer
 
 import os
 from functools import partial
+
+from .project_config import get_gpkg_path, get_layer_name, get_photo_field_name
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
     QListWidget, QGroupBox, QCheckBox, QMessageBox, QScrollArea, QWidget, QFrame
@@ -769,12 +771,13 @@ class DoublonsDialog(QDialog):
         
         try:
             from qgis.core import QgsVectorLayer
-            gpkg_file = os.path.join(os.path.dirname(self.dcim_path), "donnees_terrain.gpkg")
-            layer_name = "saisies_terrain"
+
+            gpkg_file = get_gpkg_path()
+            layer_name = get_layer_name()
             layer = QgsVectorLayer(f"{gpkg_file}|layername={layer_name}", layer_name, "ogr")
             if not layer.isValid():
                 return False
-            photo_idx = layer.fields().indexFromName('photo')
+            photo_idx = layer.fields().indexFromName(get_photo_field_name())
             if photo_idx < 0:
                 return False
             new_val = f"DCIM/{photo_conservee}" if "DCIM/" not in photo_conservee else photo_conservee

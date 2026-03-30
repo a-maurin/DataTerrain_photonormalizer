@@ -20,12 +20,24 @@ import sys
 from qgis.core import QgsVectorLayer
 
 try:
-    from ..core.project_config import get_dcim_path, get_gpkg_path
+    from ..core.project_config import (
+        get_dcim_path,
+        get_gpkg_path,
+        get_layer_name,
+        get_photo_field_name,
+        get_coord_tolerance,
+    )
 except ImportError:
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
         sys.path.insert(0, _root)
-    from core.project_config import get_dcim_path, get_gpkg_path
+    from core.project_config import (
+        get_dcim_path,
+        get_gpkg_path,
+        get_layer_name,
+        get_photo_field_name,
+        get_coord_tolerance,
+    )
 
 
 def extraire_coord_du_nom(nom_fichier):
@@ -67,7 +79,9 @@ def analyser_photos_orphelines(log_handler):
     
     # Configuration (config centralisée Linux / Windows)
     gpkg_file = get_gpkg_path()
-    layer_name = "saisies_terrain"
+    layer_name = get_layer_name()
+    pfn = get_photo_field_name()
+    tol = get_coord_tolerance()
     dcim = get_dcim_path()
     
     log_handler.info("🔍 Analyse des photos orphelines en cours...")
@@ -77,7 +91,9 @@ def analyser_photos_orphelines(log_handler):
         layer = QgsVectorLayer(f"{gpkg_file}|layername={layer_name}", layer_name, "ogr")
         if not layer.isValid():
             log_handler.error(f"❌ La couche '{layer_name}' est introuvable dans {gpkg_file}.")
-            log_handler.error("💡 Vérifiez que le fichier GeoPackage existe et contient la table 'saisies_terrain'.")
+            log_handler.error(
+                f"💡 Vérifiez que le fichier GeoPackage existe et contient la table '{layer_name}'."
+            )
             return False
         log_handler.info(f"✅ Couche '{layer_name}' chargée avec succès")
     except Exception as e:
@@ -126,7 +142,7 @@ def analyser_photos_orphelines(log_handler):
             if feature.id() == fid:
                 entite_trouvee = True
                 # Vérifier si la photo est associée
-                photo_field = feature['photo']
+                photo_field = feature[pfn]
                 if photo_field and photo in photo_field:
                     photos_avec_entite.append((photo, fid, True))
                 else:
@@ -139,7 +155,7 @@ def analyser_photos_orphelines(log_handler):
             for feature in layer.getFeatures():
                 if feature.geometry() and not feature.geometry().isEmpty():
                     point = feature.geometry().asPoint()
-                    if abs(point.x() - x) < 0.01 and abs(point.y() - y) < 0.01:
+                    if abs(point.x() - x) < tol and abs(point.y() - y) < tol:
                         entite_existante = feature
                         break
             

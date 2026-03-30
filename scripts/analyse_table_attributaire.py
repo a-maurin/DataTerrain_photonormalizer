@@ -13,12 +13,24 @@ from qgis.core import QgsVectorLayer, QgsField, QgsFieldConstraints
 from qgis.PyQt.QtCore import QVariant
 
 try:
-    from ..core.project_config import get_dcim_path, get_gpkg_path
+    from ..core.project_config import (
+        get_dcim_path,
+        get_gpkg_path,
+        get_layer_name,
+        get_photo_field_name,
+        get_coord_tolerance,
+    )
 except ImportError:
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
         sys.path.insert(0, _root)
-    from core.project_config import get_dcim_path, get_gpkg_path
+    from core.project_config import (
+        get_dcim_path,
+        get_gpkg_path,
+        get_layer_name,
+        get_photo_field_name,
+        get_coord_tolerance,
+    )
 
 
 def analyser_table_attributaire(log_handler, export_dir=None):
@@ -32,7 +44,7 @@ def analyser_table_attributaire(log_handler, export_dir=None):
     
     # Configuration (config centralisée Linux / Windows)
     gpkg_file = get_gpkg_path()
-    layer_name = "saisies_terrain"
+    layer_name = get_layer_name()
     dcim_path = get_dcim_path()
     
     log_handler.info("=" * 80)
@@ -165,7 +177,7 @@ def analyser_table_attributaire(log_handler, export_dir=None):
     log_handler.info("=" * 80)
     
     # 3.1 Champ PHOTO
-    if 'photo' in field_info:
+    if get_photo_field_name() in field_info:
         analyser_champ_photo(layer, log_handler, dcim_path)
     
     # 3.2 Champ DATE_SAISIE
@@ -204,11 +216,12 @@ def analyser_table_attributaire(log_handler, export_dir=None):
 
 def analyser_champ_photo(layer, log_handler, dcim_path):
     """Analyse détaillée du champ photo"""
-    log_handler.info("📷 CHAMP: photo")
-    
-    photo_field_idx = layer.fields().indexFromName('photo')
+    pfn = get_photo_field_name()
+    log_handler.info(f"📷 CHAMP: {pfn}")
+
+    photo_field_idx = layer.fields().indexFromName(pfn)
     if photo_field_idx < 0:
-        log_handler.warning("   ⚠️  Champ 'photo' introuvable")
+        log_handler.warning(f"   ⚠️  Champ '{pfn}' introuvable")
         return
     
     total = 0
@@ -229,7 +242,7 @@ def analyser_champ_photo(layer, log_handler, dcim_path):
     
     for feature in layer.getFeatures():
         total += 1
-        photo_val = feature['photo']
+        photo_val = feature[pfn]
         
         if not photo_val or (isinstance(photo_val, str) and photo_val.strip() == ''):
             sans_photo += 1
@@ -437,6 +450,8 @@ def analyser_champs_coordonnees(layer, log_handler):
 
 def analyser_coherence(layer, log_handler, dcim_path):
     """Analyse de cohérence entre les différents champs"""
+    pfn = get_photo_field_name()
+    tol = get_coord_tolerance()
     log_handler.info("🔍 ANALYSE DE COHÉRENCE")
     
     # Cohérence photo / FID dans le nom
@@ -448,7 +463,7 @@ def analyser_coherence(layer, log_handler, dcim_path):
     
     for feature in layer.getFeatures():
         fid = feature.id()
-        photo_val = feature['photo']
+        photo_val = feature[pfn]
         
         if not photo_val:
             continue
@@ -490,8 +505,7 @@ def analyser_coherence(layer, log_handler, dcim_path):
             y_saisie = float(feature['y_saisie']) if feature['y_saisie'] else None
             
             if x_saisie is not None and y_saisie is not None:
-                tolerance = 0.01
-                if abs(geom_point.x() - x_saisie) > tolerance or abs(geom_point.y() - y_saisie) > tolerance:
+                if abs(geom_point.x() - x_saisie) > tol or abs(geom_point.y() - y_saisie) > tol:
                     incoherences_coord += 1
                     if incoherences_coord <= 5:
                         log_handler.info(f"     ⚠️  FID {feature.id()}: géométrie ({geom_point.x():.2f}, {geom_point.y():.2f}) != coord ({x_saisie:.2f}, {y_saisie:.2f})")

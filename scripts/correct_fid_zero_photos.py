@@ -21,12 +21,24 @@ import sys
 from qgis.core import QgsProject, QgsVectorLayer, QgsFeature, QgsGeometry, QgsPointXY
 
 try:
-    from ..core.project_config import get_dcim_path, get_gpkg_path
+    from ..core.project_config import (
+        get_dcim_path,
+        get_gpkg_path,
+        get_layer_name,
+        get_photo_field_name,
+        get_coord_tolerance,
+    )
 except ImportError:
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
         sys.path.insert(0, _root)
-    from core.project_config import get_dcim_path, get_gpkg_path
+    from core.project_config import (
+        get_dcim_path,
+        get_gpkg_path,
+        get_layer_name,
+        get_photo_field_name,
+        get_coord_tolerance,
+    )
 
 
 def correct_fid_zero_photos():
@@ -36,7 +48,9 @@ def correct_fid_zero_photos():
     # Configuration (config centralisée Linux / Windows)
     dcim_path = get_dcim_path()
     gpkg_file = get_gpkg_path()
-    layer_name = "saisies_terrain"
+    layer_name = get_layer_name()
+    pfn = get_photo_field_name()
+    tol = get_coord_tolerance()
     
     # Vérifier les chemins
     if not os.path.exists(dcim_path):
@@ -81,9 +95,10 @@ def correct_fid_zero_photos():
     
     # Démarrer l'édition
     layer.startEditing()
-    photo_field_idx = layer.fields().indexFromName('photo')
+    photo_field_idx = layer.fields().indexFromName(pfn)
     if photo_field_idx < 0:
         logger.info("⚠️  Champ 'photo' introuvable")
+        layer.rollBack()
         return False
     
     photos_corrigees = 0
@@ -97,7 +112,7 @@ def correct_fid_zero_photos():
             for feature in layer.getFeatures():
                 if feature.geometry() and not feature.geometry().isEmpty():
                     point = feature.geometry().asPoint()
-                    if abs(point.x() - float(x)) < 0.01 and abs(point.y() - float(y)) < 0.01:
+                    if abs(point.x() - float(x)) < tol and abs(point.y() - float(y)) < tol:
                         existing_fid = feature.id()
                         break
             
@@ -127,7 +142,7 @@ def correct_fid_zero_photos():
                 new_feature['y_saisie'] = float(y)
                 new_feature['nom_agent'] = 'INCONNU'
                 new_feature['type_saisie'] = 'INCONNU'
-                new_feature['photo'] = f'DCIM/{photo_name}'
+                new_feature[pfn] = f'DCIM/{photo_name}'
                 
                 # Définir la géométrie
                 point = QgsPointXY(float(x), float(y))
@@ -147,7 +162,7 @@ def correct_fid_zero_photos():
                 for feature in layer.getFeatures():
                     if feature.geometry() and not feature.geometry().isEmpty():
                         feat_point = feature.geometry().asPoint()
-                        if abs(feat_point.x() - float(x)) < 0.01 and abs(feat_point.y() - float(y)) < 0.01:
+                        if abs(feat_point.x() - float(x)) < tol and abs(feat_point.y() - float(y)) < tol:
                             new_fid = feature.id()
                             break
                 

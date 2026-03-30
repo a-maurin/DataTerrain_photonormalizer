@@ -1,0 +1,3 @@
+Ce dossier contient d'anciennes versions / expérimentations du plugin.
+Le code actif se trouve à la racine du dépôt (main.py, core/, scripts/).
+Ne pas importer depuis "old/" dans le plugin QGIS.

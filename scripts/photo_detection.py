@@ -6,12 +6,22 @@ import sys
 
 # Import de la config des chemins (compatible exécution depuis QGIS ou standalone)
 try:
-    from ..core.project_config import get_dcim_path, get_gpkg_path
+    from ..core.project_config import (
+        get_dcim_path,
+        get_gpkg_path,
+        get_layer_name,
+        get_photo_field_name,
+    )
 except ImportError:
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
         sys.path.insert(0, _root)
-    from core.project_config import get_dcim_path, get_gpkg_path
+    from core.project_config import (
+        get_dcim_path,
+        get_gpkg_path,
+        get_layer_name,
+        get_photo_field_name,
+    )
 
 # Configuration du logging (sans FileHandler pour éviter ResourceWarning de fichier non fermé)
 logger = logging.getLogger(__name__)
@@ -38,8 +48,9 @@ def detect_unreferenced_photos(log_handler, export_dir):
     # Chemins depuis la config centralisée (Linux / Windows)
     dcim_path = get_dcim_path()
     gpkg_file = get_gpkg_path()
-    layer_name = "saisies_terrain"
-    
+    layer_name = get_layer_name()
+    pfn = get_photo_field_name()
+
     log_handler.info(f"🔍 Détection des photos non référencées")
     log_handler.info(f"📁 Dossier DCIM : {dcim_path}")
     log_handler.info(f"🗂️ Couche QGIS : {layer_name} dans {gpkg_file}")
@@ -80,7 +91,7 @@ def detect_unreferenced_photos(log_handler, export_dir):
         photos_with_null = 0
         
         for feature in layer.getFeatures():
-            photo_field = feature['photo']
+            photo_field = feature[pfn]
             if photo_field and isinstance(photo_field, str):
                 photo_name = photo_field.split('/')[-1]
                 if photo_name.lower().endswith(('.jpg', '.jpeg')):
